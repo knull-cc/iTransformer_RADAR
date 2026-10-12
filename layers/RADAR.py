@@ -1,4 +1,4 @@
-"""RADAR v3.0: confidence-gated, velocity-preserving input repair."""
+"""RADAR v4.0: confidence-gated distribution-level affine repair."""
 
 import math
 
@@ -35,15 +35,17 @@ class RADAR(nn.Module):
     """Filter chunks whose risk exceeds a confidence threshold.
 
     Risk combines a fixed recency prior with a local, trend-aware Gaussian
-    distribution comparison. Gated chunks retain their endpoint velocity while
-    deviations from that linear evolution are damped. The module has no
-    trainable parameters, ranking step, masks, or imputer.
+    distribution comparison. Gated chunks retain their standardized temporal
+    shape while their first two moments are moved toward the global history
+    statistics according to the risk score. The module has no trainable
+    parameters, ranking step, masks, or imputer.
     """
 
     def __init__(self, seq_len, risk_threshold=0.75, receptive_field=8,
                  anchor_window=32,
                  dependency_decay=3.0, gamma=1.0, mean_weight=0.01,
-                 variance_weight=1.0, store_diagnostics=False):
+                 variance_weight=1.0, repair_epsilon=1e-5,
+                 store_diagnostics=False):
         super().__init__()
         if not isinstance(receptive_field, int) or receptive_field < 1:
             raise ValueError("RADAR receptive_field must be a positive integer")
@@ -55,6 +57,7 @@ class RADAR(nn.Module):
             "gamma": gamma,
             "mean_weight": mean_weight,
             "variance_weight": variance_weight,
+            "repair_epsilon": repair_epsilon,
         }
         try:
             settings_are_finite = all(
@@ -69,6 +72,8 @@ class RADAR(nn.Module):
             raise ValueError("RADAR decay and gamma must be positive")
         if mean_weight < 0 or variance_weight <= 0:
             raise ValueError("RADAR statistical weights are invalid")
+        if repair_epsilon <= 0:
+            raise ValueError("RADAR repair epsilon must be positive")
 
         self.seq_len = seq_len
         self.chunk_lengths = geometric_chunk_lengths(seq_len)
@@ -80,6 +85,7 @@ class RADAR(nn.Module):
         self.gamma = float(gamma)
         self.mean_weight = float(mean_weight)
         self.variance_weight = float(variance_weight)
+        self.repair_epsilon = float(repair_epsilon)
         self.store_diagnostics = bool(store_diagnostics)
 
         chunk_bounds = []
@@ -119,15 +125,6 @@ class RADAR(nn.Module):
         for index, (start, end) in enumerate(self.chunk_bounds):
             block_ids[start:end] = index
         membership = F.one_hot(block_ids, self.num_chunks).float()
-        block_starts = torch.tensor(
-            [start for start, _ in self.chunk_bounds], dtype=torch.long)
-        block_last_indices = torch.tensor(
-            [end - 1 for _, end in self.chunk_bounds], dtype=torch.long)
-        block_spans = block_last_indices - block_starts
-        point_offsets = torch.arange(seq_len) - block_starts[block_ids]
-        endpoint_mask = (
-            point_offsets.eq(0) | point_offsets.eq(block_spans[block_ids]))
-
         gaps = torch.tensor(
             [seq_len - end for _, end in self.chunk_bounds], dtype=torch.float32)
         dependency = torch.exp(-self.dependency_decay * gaps / float(seq_len))
@@ -146,12 +143,6 @@ class RADAR(nn.Module):
         self.register_buffer("block_ids", block_ids, persistent=False)
         self.register_buffer("membership", membership, persistent=False)
         self.register_buffer("block_sizes", membership.sum(dim=0), persistent=False)
-        self.register_buffer("block_starts", block_starts, persistent=False)
-        self.register_buffer(
-            "block_last_indices", block_last_indices, persistent=False)
-        self.register_buffer("block_spans", block_spans, persistent=False)
-        self.register_buffer("point_offsets", point_offsets, persistent=False)
-        self.register_buffer("endpoint_mask", endpoint_mask, persistent=False)
         self.register_buffer("dependency_prior", dependency, persistent=False)
         self.register_buffer("anchor_valid_prior", anchor_valid, persistent=False)
         self.register_buffer(
@@ -325,30 +316,76 @@ class RADAR(nn.Module):
     def _gate(self, risk):
         return risk > self.risk_threshold
 
+    @staticmethod
+    def _standard_deviation(centered):
+        """Population standard deviation with a finite gradient at zero."""
+        variance = centered.square().mean(dim=1, keepdim=True)
+        tiny = torch.finfo(centered.dtype).tiny
+        return torch.where(
+            variance > 0,
+            torch.sqrt(variance.clamp_min(tiny)),
+            torch.zeros_like(variance),
+        )
+
+    def _chunk_statistics(self, values):
+        """Compute true-chunk population moments without a chunk loop."""
+        membership = self.membership.to(values.dtype)
+        sizes = self.block_sizes.to(values.dtype).view(1, -1, 1)
+        totals = torch.matmul(values.transpose(1, 2), membership).transpose(1, 2)
+        chunk_mean = totals / sizes
+
+        point_mean = chunk_mean[:, self.block_ids, :]
+        centered = values - point_mean
+        squared_totals = torch.matmul(
+            centered.square().transpose(1, 2), membership).transpose(1, 2)
+        variance = squared_totals / sizes
+        tiny = torch.finfo(values.dtype).tiny
+        chunk_std = torch.where(
+            variance > 0,
+            torch.sqrt(variance.clamp_min(tiny)),
+            torch.zeros_like(variance),
+        )
+        return chunk_mean, chunk_std
+
     def _repair(self, values, risk, selected):
-        """Damp residuals around each chunk's endpoint-defined evolution."""
-        block_first = values.index_select(1, self.block_starts)
-        block_last = values.index_select(1, self.block_last_indices)
-        block_spans = self.block_spans.to(values.dtype).view(1, -1, 1)
-        velocity = (block_last - block_first) / block_spans.clamp_min(1)
-        velocity = torch.where(
-            block_spans > 0, velocity, torch.zeros_like(velocity))
+        """Apply risk-conditioned distribution-level affine repair."""
+        chunk_mean, chunk_std = self._chunk_statistics(values)
 
-        point_first = block_first[:, self.block_ids, :]
-        point_velocity = velocity[:, self.block_ids, :]
-        offsets = self.point_offsets.to(values.dtype).view(1, -1, 1)
-        trend = point_first + point_velocity * offsets
+        global_mean = values.mean(dim=1, keepdim=True)
+        global_std = self._standard_deviation(values - global_mean)
 
-        # The mathematical line already reaches both endpoints. Selecting the
-        # original values explicitly also makes endpoint preservation exact in
-        # finite precision.
-        trend = torch.where(
-            self.endpoint_mask.view(1, -1, 1), values, trend)
+        # A zero effective score makes the diagnostic target moments equal to
+        # the original chunk moments. The final point mask below still provides
+        # bit-exact identity for every chunk that did not pass the hard gate.
+        effective_risk = torch.where(selected, risk, torch.zeros_like(risk))
+        safe_mean = (
+            (1 - effective_risk) * chunk_mean
+            + effective_risk * global_mean
+        )
+        safe_std = (
+            (1 - effective_risk) * chunk_std
+            + effective_risk * global_std
+        )
 
-        alpha = torch.where(selected, 1 - risk, torch.ones_like(risk))
-        point_alpha = alpha[:, self.block_ids, :]
-        repaired = trend + point_alpha * (values - trend)
-        return repaired, alpha, velocity, trend
+        point_chunk_mean = chunk_mean[:, self.block_ids, :]
+        point_chunk_std = chunk_std[:, self.block_ids, :]
+        standardized = (
+            (values - point_chunk_mean)
+            / (point_chunk_std + self.repair_epsilon)
+        )
+        point_safe_mean = safe_mean[:, self.block_ids, :]
+        point_safe_std = safe_std[:, self.block_ids, :]
+        repaired = standardized * point_safe_std + point_safe_mean
+        return repaired, {
+            "effective_risk": effective_risk,
+            "chunk_mean": chunk_mean,
+            "chunk_std": chunk_std,
+            "global_mean": global_mean,
+            "global_std": global_std,
+            "safe_mean": safe_mean,
+            "safe_std": safe_std,
+            "standardized": standardized,
+        }
 
     @staticmethod
     def _require_finite(x):
@@ -375,16 +412,16 @@ class RADAR(nn.Module):
                 selected = self._gate(risk)
                 repair_mask = self._point_mask(selected)
 
-            softened, block_alpha, velocity, trend = self._repair(
+            affine_repaired, repair_diagnostics = self._repair(
                 statistics, risk, selected)
-        repaired = torch.where(repair_mask, softened.to(original_dtype), x)
+        repaired = torch.where(
+            repair_mask, affine_repaired.to(original_dtype), x)
 
         if self.store_diagnostics:
             self.last_diagnostics = {
                 **{name: value.detach() for name, value in diagnostics.items()},
-                "alpha": block_alpha.detach(),
-                "trend": trend.detach(),
-                "velocity": velocity.detach(),
+                **{name: value.detach()
+                   for name, value in repair_diagnostics.items()},
                 "selected_blocks": selected.detach(),
                 "repair_mask": repair_mask.detach(),
             }

@@ -136,7 +136,7 @@ if __name__ == '__main__':
                 args.class_strategy, ii)
 
             if args.use_radar:
-                setting += f'_RADAR_v3_rt{args.risk_threshold:g}'
+                setting += f'_RADAR_v4_rt{args.risk_threshold:g}'
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -172,7 +172,7 @@ if __name__ == '__main__':
             args.class_strategy, ii)
 
         if args.use_radar:
-            setting += f'_RADAR_v3_rt{args.risk_threshold:g}'
+            setting += f'_RADAR_v4_rt{args.risk_threshold:g}'
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
