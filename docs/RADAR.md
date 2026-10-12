@@ -39,6 +39,29 @@ ETTh1 脚本依次运行预测长度为 96、192、336 和 720 的四组实验�
 
 直接调用 `run.py` 时，全局 batch size 默认仍为 32。`--use_radar` 默认值为 0，目前只支持 `--model iTransformer`。v5.1 没有绝对阈值参数；启用后的 checkpoint 和结果目录统一带 `_RADAR_v5_1` 后缀，与旧版本产物隔离。
 
+### 末端置零扰动
+
+可选参数 `--perturb_last_point 1` 会把每个输入窗口中所有变量的最后一个观测值置为 0。执行顺序为：
+
+```text
+原输入 → 最后一个观测点置零 → 可选 RADAR 修复 → iTransformer
+```
+
+因此，同一扰动既可用于普通 iTransformer，也可用于 RADAR 对照实验：
+
+```python
+# 扰动后的 iTransformer 基线
+!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh \
+  --perturb_last_point 1
+
+# 相同扰动先经过 RADAR，再进入 iTransformer
+!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh \
+  --use_radar 1 \
+  --perturb_last_point 1
+```
+
+该参数默认是 0。开启后会作用于训练、验证、测试和预测阶段的 encoder 输入，且不会原地修改 DataLoader 提供的张量。实验目录增加 `_LastPointZero` 后缀，避免覆盖无扰动实验。
+
 ## 1. 非等距切块与扩张感受野
 
 `seq_len=96` 时，从最近到最早的块长度为：

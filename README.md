@@ -88,6 +88,23 @@ the final partial batch, while single-window prediction continues to use batch 1
 RADAR v5.1 has no absolute gate argument. It combines instance-relative targeting
 with the original risk magnitude so low-risk healthy inputs receive negligible repair.
 
+For a controlled endpoint-corruption experiment, pass `--perturb_last_point 1`.
+This sets the final encoder observation of every variate to zero before RADAR and
+the iTransformer backbone. The switch defaults to 0 and also works with RADAR
+disabled, so the baseline and RADAR can be compared under the identical disturbance:
+
+```
+# Perturbed iTransformer baseline
+bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --perturb_last_point 1
+
+# Perturbed input repaired by RADAR before forecasting
+bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh \
+  --use_radar 1 --perturb_last_point 1
+```
+
+Perturbed experiment directories carry the `_LastPointZero` suffix to prevent
+their checkpoints and results from overwriting clean-input runs.
+
 1. The datasets can be obtained from [Google Drive](https://drive.google.com/file/d/1l51QsKvQPcqILT3DwfjCgx8Dsg2rpjot/view?usp=drive_link) or [Baidu Cloud](https://pan.baidu.com/s/11AWXg1Z6UwjHzmto4hesAA?pwd=9qjr).
 
 2. Train and evaluate the model. We provide all the above tasks under the folder ./scripts/. You can reproduce the results as the following examples:

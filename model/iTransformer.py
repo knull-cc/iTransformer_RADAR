@@ -17,6 +17,7 @@ class Model(nn.Module):
         self.pred_len = configs.pred_len
         self.output_attention = configs.output_attention
         self.use_norm = configs.use_norm
+        self.perturb_last_point = bool(getattr(configs, 'perturb_last_point', False))
         # Embedding
         self.enc_embedding = DataEmbedding_inverted(configs.seq_len, configs.d_model, configs.embed, configs.freq,
                                                     configs.dropout)
@@ -76,8 +77,19 @@ class Model(nn.Module):
 
         return dec_out, attns
 
+    def _perturb_input(self, x_enc):
+        if not self.perturb_last_point:
+            return x_enc
+        # Keep the caller's tensor untouched and remove gradients only for the
+        # deliberately corrupted final observation.
+        return torch.cat(
+            (x_enc[:, :-1, :], torch.zeros_like(x_enc[:, -1:, :])),
+            dim=1,
+        )
+
     def _repair_input(self, x_enc):
-        return x_enc if self.radar is None else self.radar(x_enc)
+        perturbed = self._perturb_input(x_enc)
+        return perturbed if self.radar is None else self.radar(perturbed)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         repaired = self._repair_input(x_enc)

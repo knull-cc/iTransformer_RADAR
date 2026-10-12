@@ -86,12 +86,16 @@ if __name__ == '__main__':
     parser.add_argument('--use_norm', type=int, default=True, help='use norm and denorm')
     parser.add_argument('--use_radar', type=int, choices=[0, 1], nargs='?', const=1, default=0,
                         help='enable RADAR input repair for iTransformer (default: 0)')
+    parser.add_argument('--perturb_last_point', type=int, choices=[0, 1], nargs='?', const=1, default=0,
+                        help='set the last encoder observation of every variate to zero before RADAR/backbone (default: 0)')
     parser.add_argument('--partial_start_index', type=int, default=0, help='the start index of variates for partial training, '
                                                                            'you can select [partial_start_index, min(enc_in + partial_start_index, N)]')
 
     args = parser.parse_args()
     if args.use_radar and args.model != 'iTransformer':
         parser.error('--use_radar currently supports --model iTransformer')
+    if args.perturb_last_point and args.model != 'iTransformer':
+        parser.error('--perturb_last_point currently supports --model iTransformer')
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -133,6 +137,8 @@ if __name__ == '__main__':
 
             if args.use_radar:
                 setting += '_RADAR_v5_1'
+            if args.perturb_last_point:
+                setting += '_LastPointZero'
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -169,6 +175,8 @@ if __name__ == '__main__':
 
         if args.use_radar:
             setting += '_RADAR_v5_1'
+        if args.perturb_last_point:
+            setting += '_LastPointZero'
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))

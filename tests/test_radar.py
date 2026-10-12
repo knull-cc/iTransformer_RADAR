@@ -15,7 +15,7 @@ def config(**changes):
                   d_model=16, embed='timeF', freq='h', dropout=0.25,
                   class_strategy='projection', factor=1, n_heads=2,
                   d_ff=32, activation='gelu', e_layers=1, features='M',
-                  use_radar=True)
+                  use_radar=True, perturb_last_point=False)
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -486,6 +486,48 @@ class RiskAndRepairTests(unittest.TestCase):
 
 
 class BackboneIntegrationTests(unittest.TestCase):
+    def test_last_point_perturbation_is_opt_in_and_does_not_mutate_input(self):
+        history = smooth_history().requires_grad_()
+        original = history.detach().clone()
+
+        disabled = Model(config(use_radar=False, perturb_last_point=False))
+        enabled = Model(config(use_radar=False, perturb_last_point=True))
+
+        self.assertIs(disabled._perturb_input(history), history)
+        perturbed = enabled._perturb_input(history)
+        torch.testing.assert_close(perturbed[:, :-1, :], original[:, :-1, :])
+        torch.testing.assert_close(
+            perturbed[:, -1, :], torch.zeros_like(perturbed[:, -1, :]))
+        torch.testing.assert_close(history.detach(), original, rtol=0, atol=0)
+
+        perturbed.sum().backward()
+        torch.testing.assert_close(
+            history.grad[:, :-1, :], torch.ones_like(history.grad[:, :-1, :]))
+        torch.testing.assert_close(
+            history.grad[:, -1, :], torch.zeros_like(history.grad[:, -1, :]))
+
+    def test_last_point_is_zeroed_before_radar(self):
+        class CaptureInput(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.seen = None
+
+            def forward(self, value):
+                self.seen = value
+                return value
+
+        model = Model(config(perturb_last_point=True))
+        capture = CaptureInput()
+        model.radar = capture
+        history = smooth_history()
+
+        prepared = model._repair_input(history)
+
+        self.assertIs(prepared, capture.seen)
+        torch.testing.assert_close(
+            capture.seen[:, -1, :], torch.zeros_like(capture.seen[:, -1, :]))
+        torch.testing.assert_close(capture.seen[:, :-1, :], history[:, :-1, :])
+
     def test_disabled_bypasses_plugin_and_keeps_backbone_initialization(self):
         torch.manual_seed(11)
         disabled = Model(config(use_radar=False)).eval()
