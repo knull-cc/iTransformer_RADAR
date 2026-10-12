@@ -1,4 +1,4 @@
-"""RADAR v2: recency-aware risk scoring and soft residual suppression."""
+"""RADAR v2.1: confidence-gated risk scoring and soft residual suppression."""
 
 import math
 
@@ -32,26 +32,26 @@ def geometric_chunk_lengths(seq_len):
 
 
 class RADAR(nn.Module):
-    """Filter at most top_k risky chunks before the forecasting backbone.
+    """Filter chunks whose risk exceeds a confidence threshold.
 
     Risk combines a fixed recency prior with a local, trend-aware Gaussian
-    distribution comparison. Selected chunks keep their own mean and only have
+    distribution comparison. Gated chunks keep their own mean and only have
     their residual amplitude reduced. The module has no trainable parameters,
-    masks, or imputer.
+    ranking step, masks, or imputer.
     """
 
-    def __init__(self, seq_len, top_k=3, receptive_field=8, anchor_window=32,
+    def __init__(self, seq_len, risk_threshold=0.75, receptive_field=8,
+                 anchor_window=32,
                  dependency_decay=3.0, gamma=1.0, mean_weight=0.01,
                  variance_weight=1.0, repair_strength=10.0,
                  store_diagnostics=False):
         super().__init__()
-        if not isinstance(top_k, int) or top_k < 1:
-            raise ValueError("RADAR top_k must be a positive integer")
         if not isinstance(receptive_field, int) or receptive_field < 1:
             raise ValueError("RADAR receptive_field must be a positive integer")
         if not isinstance(anchor_window, int) or anchor_window < 1:
             raise ValueError("RADAR anchor_window must be a positive integer")
         scalar_settings = {
+            "risk_threshold": risk_threshold,
             "dependency_decay": dependency_decay,
             "gamma": gamma,
             "mean_weight": mean_weight,
@@ -65,6 +65,8 @@ class RADAR(nn.Module):
             settings_are_finite = False
         if not settings_are_finite:
             raise ValueError("RADAR scalar settings must be finite real numbers")
+        if not 0 <= risk_threshold <= 1:
+            raise ValueError("RADAR risk_threshold must be between 0 and 1")
         if dependency_decay <= 0 or gamma <= 0 or repair_strength <= 0:
             raise ValueError("RADAR decay, gamma, and repair strength must be positive")
         if mean_weight < 0 or variance_weight <= 0:
@@ -73,7 +75,7 @@ class RADAR(nn.Module):
         self.seq_len = seq_len
         self.chunk_lengths = geometric_chunk_lengths(seq_len)
         self.num_chunks = len(self.chunk_lengths)
-        self.top_k = min(top_k, self.num_chunks)
+        self.risk_threshold = float(risk_threshold)
         self.receptive_field = receptive_field
         self.anchor_window = anchor_window
         self.dependency_decay = float(dependency_decay)
@@ -314,11 +316,8 @@ class RADAR(nn.Module):
             "anchor_valid": anchor_valid.expand_as(reliability),
         }
 
-    def _select(self, risk):
-        values, indices = risk.topk(self.top_k, dim=1)
-        selected = torch.zeros_like(risk, dtype=torch.bool)
-        selected.scatter_(1, indices, values > 0)
-        return selected
+    def _gate(self, risk):
+        return risk > self.risk_threshold
 
     @staticmethod
     def _require_finite(x):
@@ -342,7 +341,7 @@ class RADAR(nn.Module):
                 score = self._score(statistics, detailed=self.store_diagnostics)
                 diagnostics = score if self.store_diagnostics else None
                 risk = diagnostics["risk"] if diagnostics is not None else score
-                selected = self._select(risk)
+                selected = self._gate(risk)
                 block_alpha = torch.exp(
                     -self.repair_strength * risk.square())
                 block_alpha = torch.where(

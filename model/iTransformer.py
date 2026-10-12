@@ -39,7 +39,14 @@ class Model(nn.Module):
         self.projector = nn.Linear(configs.d_model, configs.pred_len, bias=True)
 
         # Construct after the backbone so its initialization stays identical.
-        self.radar = RADAR(configs.seq_len) if getattr(configs, 'use_radar', False) else None
+        self.radar = (
+            RADAR(
+                configs.seq_len,
+                risk_threshold=getattr(configs, 'risk_threshold', 0.75),
+            )
+            if getattr(configs, 'use_radar', False)
+            else None
+        )
 
     def _forecast_backbone(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.use_norm:

@@ -1,4 +1,4 @@
-"""Behavioral tests for the lightweight RADAR v2 input filter."""
+"""Behavioral tests for the lightweight RADAR v2.1 input filter."""
 
 import unittest
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ def config(**changes):
                   d_model=16, embed='timeF', freq='h', dropout=0.25,
                   class_strategy='projection', factor=1, n_heads=2,
                   d_ff=32, activation='gelu', e_layers=1, features='M',
-                  use_radar=True)
+                  use_radar=True, risk_threshold=0.75)
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -66,12 +66,13 @@ class ChunkingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 geometric_chunk_lengths(length)
         invalid = [
-            dict(top_k=0), dict(receptive_field=0), dict(anchor_window=0),
+            dict(risk_threshold=-0.01), dict(risk_threshold=1.01),
+            dict(receptive_field=0), dict(anchor_window=0),
             dict(dependency_decay=0), dict(gamma=0), dict(mean_weight=-1),
             dict(variance_weight=0), dict(repair_strength=0),
         ]
         for setting in [
-                'dependency_decay', 'gamma', 'mean_weight',
+                'risk_threshold', 'dependency_decay', 'gamma', 'mean_weight',
                 'variance_weight', 'repair_strength']:
             for value in [float('nan'), float('inf'), float('-inf')]:
                 invalid.append({setting: value})
@@ -81,6 +82,27 @@ class ChunkingTests(unittest.TestCase):
 
 
 class RiskAndRepairTests(unittest.TestCase):
+    def test_confidence_gate_is_strict_and_has_no_top_k_cap(self):
+        radar = diagnostic_radar(96, risk_threshold=0.75)
+        risk = torch.tensor(
+            [[[0.00], [0.75], [0.76], [0.77], [0.80], [0.90], [1.00], [0.10]]])
+
+        selected = radar._gate(risk)
+
+        torch.testing.assert_close(selected, risk > 0.75)
+        self.assertEqual(selected.sum().item(), 5)
+
+    def test_all_scores_below_threshold_produce_exact_identity_mapping(self):
+        radar = diagnostic_radar(96, risk_threshold=0.75)
+        history = smooth_history()
+
+        repaired = radar(history)
+        diagnostics = radar.last_diagnostics
+
+        self.assertTrue((diagnostics['risk'] <= radar.risk_threshold).all())
+        self.assertFalse(diagnostics['selected_blocks'].any())
+        torch.testing.assert_close(repaired, history, rtol=0, atol=0)
+
     def test_recent_short_chunk_statistics_use_the_expanded_receptive_field(self):
         radar = diagnostic_radar(96)
         history = torch.arange(96, dtype=torch.float32).view(1, 96, 1)
@@ -178,7 +200,10 @@ class RiskAndRepairTests(unittest.TestCase):
         diagnostics = radar.last_diagnostics
 
         self.assertTrue(diagnostics['selected_blocks'][0, -1, 0])
-        self.assertEqual(diagnostics['selected_blocks'].sum().item(), 3)
+        torch.testing.assert_close(
+            diagnostics['selected_blocks'],
+            diagnostics['risk'] > radar.risk_threshold,
+        )
         torch.testing.assert_close(
             diagnostics['risk'],
             diagnostics['dependency'] * (1 - diagnostics['reliability']),
@@ -241,7 +266,10 @@ class RiskAndRepairTests(unittest.TestCase):
             rtol=0,
             atol=0,
         )
-        self.assertTrue((diagnostics['selected_blocks'].sum(dim=1) <= 3).all())
+        torch.testing.assert_close(
+            diagnostics['selected_blocks'],
+            diagnostics['risk'] > radar.risk_threshold,
+        )
         self.assertTrue(all(not value.requires_grad for value in diagnostics.values()))
 
     def test_invalid_input_shape_fails_explicitly(self):
@@ -294,7 +322,7 @@ class BackboneIntegrationTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_enabled_model_runs_one_backbone_pass_and_adds_no_parameters(self):
-        model = Model(config()).eval()
+        model = Model(config(risk_threshold=0.8)).eval()
         backbone_calls = []
         handle = model.enc_embedding.register_forward_hook(
             lambda module, inputs, output: backbone_calls.append(1))
@@ -306,6 +334,7 @@ class BackboneIntegrationTests(unittest.TestCase):
 
         self.assertEqual(prediction.shape, (4, 12, 3))
         self.assertEqual(backbone_calls, [1])
+        self.assertEqual(model.radar.risk_threshold, 0.8)
         self.assertEqual(sum(parameter.numel() for parameter in model.radar.parameters()), 0)
         self.assertIsNone(model.radar.last_diagnostics)
 
