@@ -42,7 +42,8 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
         return criterion
 
     def vali(self, vali_data, vali_loader, criterion, partial_train=False):
-        total_loss = []
+        total_loss = 0.0
+        total_samples = 0
         self.model.eval()
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
@@ -84,9 +85,9 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
                                 B, N, -1).permute(0, 2, 1)
                         else:
                             outputs = self.model(batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
-                                                 batch_x_mark.repeat(N, 1, 1), \
+                                                 batch_x_mark.repeat_interleave(N, dim=0), \
                                                  dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
-                                                 batch_y_mark.repeat(N, 1, 1)) \
+                                                 batch_y_mark.repeat_interleave(N, dim=0)) \
                                 .reshape(B, N, -1).permute(0, 2, 1)
                     else:
                         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -99,8 +100,10 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
 
                 loss = criterion(pred, true)
 
-                total_loss.append(loss)
-        total_loss = np.average(total_loss)
+                batch_size = pred.shape[0]
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+        total_loss = total_loss / total_samples if total_samples else np.nan
         self.model.train()
         return total_loss
 
@@ -185,13 +188,11 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
                                 dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1), batch_y_mark)
                             outputs = outputs.reshape(B, N, -1).permute(0, 2, 1)
                         else:
-                            a = batch_x.permute(0, 2, 1)
-                            b = batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1)
                             outputs, radar_loss = self._forward_training(
                                 batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
-                                batch_x_mark.repeat(N, 1, 1),
+                                batch_x_mark.repeat_interleave(N, dim=0),
                                 dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
-                                batch_y_mark.repeat(N, 1, 1))
+                                batch_y_mark.repeat_interleave(N, dim=0))
                             outputs = outputs.reshape(B, N, -1).permute(0, 2, 1)
                     else:
                         outputs, radar_loss = self._forward_training(batch_x, batch_x_mark, dec_inp, batch_y_mark)
@@ -287,9 +288,9 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
                                 B, N, -1).permute(0, 2, 1)
                         else:
                             outputs = self.model(batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
-                                                 batch_x_mark.repeat(N, 1, 1), \
+                                                 batch_x_mark.repeat_interleave(N, dim=0), \
                                                  dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
-                                                 batch_y_mark.repeat(N, 1, 1)) \
+                                                 batch_y_mark.repeat_interleave(N, dim=0)) \
                                 .reshape(B, N, -1).permute(0, 2, 1)
                     else:
                         # directly test the trained model on all variates without fine-tuning.
@@ -302,8 +303,8 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
                 batch_y = batch_y.detach().cpu().numpy()
                 if test_data.scale and self.args.inverse:
                     shape = outputs.shape
-                    outputs = test_data.inverse_transform(outputs.squeeze(0)).reshape(shape)
-                    batch_y = test_data.inverse_transform(batch_y.squeeze(0)).reshape(shape)
+                    outputs = test_data.inverse_transform(outputs.reshape(-1, shape[-1])).reshape(shape)
+                    batch_y = test_data.inverse_transform(batch_y.reshape(-1, shape[-1])).reshape(shape)
 
                 pred = outputs
                 true = batch_y
@@ -314,13 +315,13 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
                     input = batch_x.detach().cpu().numpy()
                     if test_data.scale and self.args.inverse:
                         shape = input.shape
-                        input = test_data.inverse_transform(input.squeeze(0)).reshape(shape)
+                        input = test_data.inverse_transform(input.reshape(-1, shape[-1])).reshape(shape)
                     gt = np.concatenate((input[0, :, -1], true[0, :, -1]), axis=0)
                     pd = np.concatenate((input[0, :, -1], pred[0, :, -1]), axis=0)
                     visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
 
-        preds = np.array(preds)
-        trues = np.array(trues)
+        preds = np.concatenate(preds, axis=0)
+        trues = np.concatenate(trues, axis=0)
         print('test shape:', preds.shape, trues.shape)
         preds = preds.reshape(-1, preds.shape[-2], preds.shape[-1])
         trues = trues.reshape(-1, trues.shape[-2], trues.shape[-1])

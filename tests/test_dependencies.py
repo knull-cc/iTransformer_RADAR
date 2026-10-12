@@ -67,7 +67,7 @@ class OptionalDependencyTests(unittest.TestCase):
 
 
 class ETTh1ScriptTests(unittest.TestCase):
-    def run_script(self, fail=False, visible_devices=None):
+    def run_script(self, fail=False, visible_devices=None, extra_args=()):
         with tempfile.TemporaryDirectory(prefix='radar-script-') as directory:
             root = Path(directory)
             capture = root / 'calls.jsonl'
@@ -92,7 +92,7 @@ class ETTh1ScriptTests(unittest.TestCase):
             else:
                 environment['CUDA_VISIBLE_DEVICES'] = visible_devices
             result = subprocess.run(['bash', str(PROJECT_ROOT / 'scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh'),
-                                     '--use_radar', '1'], cwd=PROJECT_ROOT, env=environment,
+                                     '--use_radar', '1', *extra_args], cwd=PROJECT_ROOT, env=environment,
                                     capture_output=True, text=True)
             calls = [json.loads(line) for line in capture.read_text().splitlines()]
             return result, calls
@@ -108,6 +108,17 @@ class ETTh1ScriptTests(unittest.TestCase):
             self.assertEqual(args[args.index('--pred_len') + 1], horizon)
             self.assertEqual(args[args.index('--d_model') + 1], width)
             self.assertEqual(args[args.index('--d_ff') + 1], width)
+            self.assertEqual(args[args.index('--batch_size') + 1], '128')
+
+    def test_command_line_batch_override_is_forwarded_last(self):
+        result, calls = self.run_script(extra_args=('--batch_size', '64'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 4)
+        for call in calls:
+            args = call['arguments']
+            batch_sizes = [args[index + 1] for index, value in enumerate(args)
+                           if value == '--batch_size']
+            self.assertEqual(batch_sizes, ['128', '64'])
 
     def test_explicit_gpu_choice_is_preserved(self):
         result, calls = self.run_script(visible_devices='2')

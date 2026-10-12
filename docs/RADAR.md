@@ -12,14 +12,30 @@ RADAR 在 iTransformer 的归一化与 embedding **之前**执行：历史时序
 %pip install -r /content/iTransformer_RADAR/requirements.txt
 ```
 
-安装成功后，运行 ETTh1 四组原始配置并启用 RADAR：
+安装成功后，可以先运行关闭 RADAR 的 iTransformer 基线：
+
+```python
+%cd /content/iTransformer_RADAR
+!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh
+```
+
+启用 RADAR 时只需增加开关：
 
 ```python
 %cd /content/iTransformer_RADAR
 !bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --use_radar 1
 ```
 
-该脚本默认使用 GPU 0，保留显式设置的 `CUDA_VISIBLE_DEVICES`，向全部四次运行转发附加参数，并在首次失败时停止。四组预测长度、模型维度和其他原有训练参数保持原样；不传附加参数时 RADAR 仍默认关闭。数据文件需要放在 `/content/iTransformer_RADAR/dataset/ETT-small/ETTh1.csv`。
+该脚本默认使用 GPU 0，保留显式设置的 `CUDA_VISIBLE_DEVICES`，向全部四次运行转发附加参数，并在首次失败时停止。它会依次训练预测长度为 96、192、336 和 720 的四组实验。模型维度、学习率和训练轮数保持原配置，batch size 默认从 32 调为 128；不传附加参数时 RADAR 仍默认关闭。数据文件需要放在 `/content/iTransformer_RADAR/dataset/ETT-small/ETTh1.csv`。
+
+显存不足时可以覆盖脚本默认值；附加参数位于命令末尾，因此最后的值会生效：
+
+```python
+!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --batch_size 64
+!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --batch_size 64 --use_radar 1
+```
+
+训练、验证和测试都使用 `--batch_size`。验证和测试会保留最后一个不足整批的 batch，并按样本数汇总损失；`--do_predict` 的单窗口预测仍使用 batch size 1。直接调用 `run.py` 时，全局默认值仍为 32，需要显式传入 `--batch_size 128` 才会改变。
 
 运行 iTransformer 不再强制加载 Reformer 包；只有构造 `Reformer` / `iReformer` 时才加载。如果缺少该包，错误会给出安装命令。数据加载器也使用 pandas 2.x 支持的 `drop(columns=...)` 写法。
 
@@ -43,6 +59,7 @@ python -u run.py \
   --des Exp \
   --d_model 256 \
   --d_ff 256 \
+  --batch_size 128 \
   --itr 1 \
   --use_radar 1
 ```

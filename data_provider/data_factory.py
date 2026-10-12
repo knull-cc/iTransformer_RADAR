@@ -19,8 +19,8 @@ def data_provider(args, flag):
 
     if flag == 'test':
         shuffle_flag = False
-        drop_last = True
-        batch_size = 1  # bsz=1 for evaluation
+        drop_last = False
+        batch_size = args.batch_size
         freq = args.freq
     elif flag == 'pred':
         shuffle_flag = False
@@ -29,8 +29,8 @@ def data_provider(args, flag):
         freq = args.freq
         Data = Dataset_Pred
     else:
-        shuffle_flag = True
-        drop_last = True
+        shuffle_flag = flag == 'train'
+        drop_last = flag == 'train'
         batch_size = args.batch_size  # bsz for train and valid
         freq = args.freq
 

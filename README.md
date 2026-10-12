@@ -77,6 +77,9 @@ their version ranges, including Colab's CUDA-enabled PyTorch. In Colab, use
 checkout. Run ETTh1 with RADAR using
 `bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --use_radar 1`.
 The ETTh1 script defaults to GPU 0 and forwards extra arguments to all four runs.
+It uses batch size 128 for training, validation, and testing; pass
+`--batch_size 64` (or another value) to override it. Validation and testing retain
+the final partial batch, while single-window prediction continues to use batch 1.
 
 1. The datasets can be obtained from [Google Drive](https://drive.google.com/file/d/1l51QsKvQPcqILT3DwfjCgx8Dsg2rpjot/view?usp=drive_link) or [Baidu Cloud](https://pan.baidu.com/s/11AWXg1Z6UwjHzmto4hesAA?pwd=9qjr).
 
