@@ -1,4 +1,4 @@
-"""RADAR v5.0: instance-normalized, risk-adaptive affine repair."""
+"""RADAR v5.1: confidence-calibrated relative-risk affine repair."""
 
 import math
 
@@ -36,10 +36,12 @@ class RADAR(nn.Module):
 
     Risk combines a fixed recency prior with a local, trend-aware Gaussian
     distribution comparison. Risk is min-max normalized over the chunks of
-    each sample and variate. The resulting soft strength moves every chunk's
-    first two moments toward the global history statistics while preserving
-    its standardized temporal shape. The safest chunk has zero strength. The
-    module has no trainable parameters, ranking step, hard gate, or imputer.
+    each sample and variate, then calibrated by its original absolute value.
+    This preserves relative targeting without forcing a healthy chunk to have
+    unit repair strength. The resulting soft strength moves each chunk's first
+    two moments toward the global history statistics while preserving its
+    standardized temporal shape. The module has no trainable parameters,
+    ranking step, hard gate, or imputer.
     """
 
     def __init__(self, seq_len, receptive_field=8, anchor_window=32,
@@ -351,20 +353,20 @@ class RADAR(nn.Module):
         chunk_std = self._safe_sqrt(variance)
         return chunk_mean, chunk_std
 
-    def _repair(self, values, normalized_risk):
-        """Apply instance-normalized distribution-level affine repair."""
+    def _repair(self, values, repair_strength):
+        """Apply confidence-calibrated distribution-level affine repair."""
         chunk_mean, chunk_std = self._chunk_statistics(values)
 
         global_mean = values.mean(dim=1, keepdim=True)
         global_std = self._standard_deviation(values - global_mean)
 
         safe_mean = (
-            (1 - normalized_risk) * chunk_mean
-            + normalized_risk * global_mean
+            (1 - repair_strength) * chunk_mean
+            + repair_strength * global_mean
         )
         safe_std = (
-            (1 - normalized_risk) * chunk_std
-            + normalized_risk * global_std
+            (1 - repair_strength) * chunk_std
+            + repair_strength * global_std
         )
 
         point_chunk_mean = chunk_mean[:, self.block_ids, :]
@@ -378,7 +380,7 @@ class RADAR(nn.Module):
             (values - point_chunk_mean)
             / standardization_scale
         )
-        point_repair_strength = normalized_risk[:, self.block_ids, :]
+        point_repair_strength = repair_strength[:, self.block_ids, :]
 
         # This correction form is algebraically identical to
         # Z * sigma_safe + mu_safe. Starting from `values` makes zero-strength
@@ -422,8 +424,9 @@ class RADAR(nn.Module):
             diagnostics = score if self.store_diagnostics else None
             risk = diagnostics["risk"] if diagnostics is not None else score
             normalized_risk, risk_min, risk_max = self._normalize_risk(risk)
+            repair_strength = normalized_risk * risk
             repaired, repair_diagnostics = self._repair(
-                statistics, normalized_risk)
+                statistics, repair_strength)
         repaired = repaired.to(original_dtype)
 
         if self.store_diagnostics:
@@ -432,6 +435,7 @@ class RADAR(nn.Module):
                 **{name: value.detach()
                    for name, value in repair_diagnostics.items()},
                 "normalized_risk": normalized_risk.detach(),
+                "repair_strength": repair_strength.detach(),
                 "risk_min": risk_min.detach(),
                 "risk_max": risk_max.detach(),
             }

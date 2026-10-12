@@ -2,14 +2,16 @@
 
 ## RADAR input repair
 
-This checkout includes the optional RADAR v5.0 plugin for iTransformer: recency-aware
+This checkout includes the optional RADAR v5.1 plugin for iTransformer: recency-aware
 nonuniform chunks, expanded receptive fields for short chunks, a fixed exponential
 recency prior, local trend-aware reliability, instance-level risk normalization, and
-distribution-level affine repair in observation space. The normalized risk is a soft
-repair strength, so there is no absolute threshold or hard gate. RADAR v5.0 has no
+distribution-level affine repair in observation space. Normalized relative risk is
+calibrated by the original risk before becoming a soft repair strength, so healthy
+inputs are not forced to contain a unit-strength repair. There is no absolute
+threshold or hard gate. RADAR v5.1 has no
 imputer or trainable parameters and invokes the forecasting backbone only once per
 batch. Add `--use_radar 1` to an existing iTransformer command; the default is
-disabled. Enabled experiments use a `_RADAR_v5` suffix for checkpoints and results. See
+disabled. Enabled experiments use a `_RADAR_v5_1` suffix for checkpoints and results. See
 [the RADAR implementation and usage guide](docs/RADAR.md).
 
 The repo is the official implementation for the paper: [iTransformer: Inverted Transformers Are Effective for Time Series Forecasting](https://arxiv.org/abs/2310.06625). [[Slides]](https://cloud.tsinghua.edu.cn/f/175ff98f7e2d44fbbe8e/), [[Poster]](https://cloud.tsinghua.edu.cn/f/36a2ae6c132d44c0bd8c/), [[Intro (CN)]](https://mp.weixin.qq.com/s/-pvBnA1_NSloNxa6TYXTSg).
@@ -83,8 +85,8 @@ The ETTh1 script defaults to GPU 0 and forwards extra arguments to all four runs
 It uses batch size 128 for training, validation, and testing; pass
 `--batch_size 64` (or another value) to override it. Validation and testing retain
 the final partial batch, while single-window prediction continues to use batch 1.
-RADAR v5.0 has no absolute gate argument; repair strength is normalized within
-each sample and variate.
+RADAR v5.1 has no absolute gate argument. It combines instance-relative targeting
+with the original risk magnitude so low-risk healthy inputs receive negligible repair.
 
 1. The datasets can be obtained from [Google Drive](https://drive.google.com/file/d/1l51QsKvQPcqILT3DwfjCgx8Dsg2rpjot/view?usp=drive_link) or [Baidu Cloud](https://pan.baidu.com/s/11AWXg1Z6UwjHzmto4hesAA?pwd=9qjr).
 

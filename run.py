@@ -132,7 +132,7 @@ if __name__ == '__main__':
                 args.class_strategy, ii)
 
             if args.use_radar:
-                setting += '_RADAR_v5'
+                setting += '_RADAR_v5_1'
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -168,7 +168,7 @@ if __name__ == '__main__':
             args.class_strategy, ii)
 
         if args.use_radar:
-            setting += '_RADAR_v5'
+            setting += '_RADAR_v5_1'
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))

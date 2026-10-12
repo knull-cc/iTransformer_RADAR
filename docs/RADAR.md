@@ -1,10 +1,10 @@
-# RADAR v5.0：实例级风险归一化与靶向软修复
+# RADAR v5.1：置信度校准的相对风险软修复
 
-RADAR v5.0 是 iTransformer 的可选前置模块。它遵循同一条处理链：**识别高依赖但低可靠的风险观测，只按相对风险强度修复这些块，再把修复后的原始时序交给 forecasting backbone。**
+RADAR v5.1 是 iTransformer 的可选前置模块。它遵循同一条处理链：**识别高依赖但低可靠的风险观测，只按有绝对证据支撑的相对风险强度修复这些块，再把修复后的原始时序交给 forecasting backbone。**
 
-完整流程为：非等距切块 → 近期依赖先验 → 局部分布可靠性 → 联合风险 → 实例级风险归一化 → 分布级仿射软修复 → iTransformer。
+完整流程为：非等距切块 → 近期依赖先验 → 局部分布可靠性 → 联合风险 → 实例级相对风险归一化 → 原始风险置信度校准 → 分布级仿射软修复 → iTransformer。
 
-v5.0 保留 v4.0 的切块、感受野、局部 Anchor、联合风险和分布级仿射修复，删除绝对阈值参数和布尔修复掩码。每个样本、每个变量都在自己的 Chunk 维度内归一化风险；归一化结果直接作为连续的修复强度。模块不使用 Top-K、Hard Mask、均值平滑、Imputer 或辅助重建损失。每个 batch 只执行一次 forecasting backbone，RADAR 没有可训练参数，也不会读取预测标签或 decoder 的未来占位值。
+v5.1 保留 v5.0 的实例级相对排序，但不再把 Min-Max 结果直接当作修复强度。归一化结果还要乘以原始联合风险，使“这个块在本实例中最危险”和“它确实具有足够风险证据”同时成立。这样不会因为健康序列中存在极小的风险差异，就强制制造一个接近 1 的修复块。模块仍不使用绝对阈值、Top-K、Hard Mask、均值平滑、Imputer 或辅助重建损失。每个 batch 只执行一次 forecasting backbone，RADAR 没有可训练参数，也不会读取预测标签或 decoder 的未来占位值。
 
 ## 启用与 Colab 运行
 
@@ -21,7 +21,7 @@ v5.0 保留 v4.0 的切块、感受野、局部 Anchor、联合风险和分布�
 !bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh
 ```
 
-启用 RADAR v5.0：
+启用 RADAR v5.1：
 
 ```python
 %cd /content/iTransformer_RADAR
@@ -37,7 +37,7 @@ ETTh1 脚本依次运行预测长度为 96、192、336 和 720 的四组实验�
   --num_workers 2
 ```
 
-直接调用 `run.py` 时，全局 batch size 默认仍为 32。`--use_radar` 默认值为 0，目前只支持 `--model iTransformer`。v5.0 已删除绝对阈值参数；启用后的 checkpoint 和结果目录统一带 `_RADAR_v5` 后缀，与旧版本产物隔离。
+直接调用 `run.py` 时，全局 batch size 默认仍为 32。`--use_radar` 默认值为 0，目前只支持 `--model iTransformer`。v5.1 没有绝对阈值参数；启用后的 checkpoint 和结果目录统一带 `_RADAR_v5_1` 后缀，与旧版本产物隔离。
 
 ## 1. 非等距切块与扩张感受野
 
@@ -121,9 +121,9 @@ d_{\sigma,i}=\frac{[\max(v_i-v_i^A,0)]^2}{q_i},
 \operatorname{Risk}_i=D_i(1-R_i).
 \]
 
-## 3. 实例级风险归一化
+## 3. 实例级相对风险与绝对证据校准
 
-v5.0 不再把原始风险与一个跨数据集共享的绝对阈值比较。对每个 `(batch, variate)` 独立沿 Chunk 维归一化：
+先对每个 `(batch, variate)` 独立沿 Chunk 维归一化：
 
 \[
 r_{\min}=\min_i \operatorname{Risk}_i, \qquad
@@ -131,14 +131,20 @@ r_{\max}=\max_i \operatorname{Risk}_i,
 \]
 
 \[
-S_i=\frac{\operatorname{Risk}_i-r_{\min}}
+N_i=\frac{\operatorname{Risk}_i-r_{\min}}
 {r_{\max}-r_{\min}+\epsilon_r},
 \qquad \epsilon_r=10^{-5}.
 \]
 
-`S` 的形状仍为 `[B,K,C]`。最安全块严格得到 `S=0`；风险跨度明显大于 `1e-5` 时，最危险块的 `S` 非常接近 1。由于公式显式在分母加了 `1e-5`，有限风险跨度下最大值是 `span/(span+1e-5)`，而不是浮点意义下严格等于 1。若所有块风险相同，则分子全为 0，所有 `S` 都为 0，整个实例保持恒等映射。
+`N` 表示实例内部的相对风险位置。最安全块严格得到 `N=0`；风险跨度明显大于 `1e-5` 时，最危险块的 `N` 非常接近 1。有限风险跨度下最大值是 `span/(span+1e-5)`。若所有块风险相同，则所有 `N` 都为 0。
 
-这个归一化是实例级、变量级的相对选择：不同样本或不同变量之间不会互相决定修复强度，也不执行排序、Top-K、阈值比较或布尔门控。
+v5.0 直接使用 `N` 修复，导致任意非恒定风险分布都会产生近单位强度，即使原始最大风险只有 `0.006`。v5.1 使用原始风险进行置信度校准：
+
+\[
+S_i=N_i\operatorname{Risk}_i.
+\]
+
+最终修复强度满足 `0 <= S_i <= Risk_i <= 1`。相对排名负责定位，原始风险负责判断证据强弱。健康序列即使存在相对最高块，只要原始风险很小，修复也很小；真正的高依赖低可靠块同时具有较大的 `N_i` 和 `Risk_i`。整个过程仍不执行排序、Top-K、阈值比较或布尔门控。
 
 ## 4. 分布级仿射软修复
 
@@ -164,7 +170,7 @@ S_i=\frac{\operatorname{Risk}_i-r_{\min}}
 Z_{i,t}=\frac{x_{i,t}-\mu_i}{\sigma_i}.
 \]
 
-常数块使用稳定分母且得到 `Z=0`。随后直接以归一化风险 `S_i` 融合块统计量和全局统计量：
+常数块使用稳定分母且得到 `Z=0`。随后以校准后的修复强度 `S_i` 融合块统计量和全局统计量：
 
 \[
 \mu_i^{safe}=(1-S_i)\mu_i+S_i\mu_g,
@@ -191,7 +197,7 @@ Chunk 统计通过预缓存的块归属矩阵和批量矩阵乘法完成；归�
 
 ## 默认内部设置
 
-v5.0 只提供外部开关 `--use_radar`。内部默认值位于 `layers/RADAR.py`：
+v5.1 只提供外部开关 `--use_radar`。内部默认值位于 `layers/RADAR.py`：
 
 | 设置 | 默认值 |
 | --- | ---: |
@@ -220,6 +226,7 @@ dependency = diagnostics['dependency']                    # [B, K, C]
 reliability = diagnostics['reliability']                  # [B, K, C]
 risk = diagnostics['risk']                                # [B, K, C]
 normalized_risk = diagnostics['normalized_risk']          # [B, K, C]
+repair_strength = diagnostics['repair_strength']          # [B, K, C] = normalized_risk * risk
 risk_min = diagnostics['risk_min']                        # [B, 1, C]
 risk_max = diagnostics['risk_max']                        # [B, 1, C]
 chunk_mean = diagnostics['chunk_mean']                    # [B, K, C]
@@ -247,13 +254,13 @@ model.radar.set_diagnostics(False)
 
 ## 训练、checkpoint 与版本边界
 
-RADAR v5.0 是确定性的无参数前置模块。训练损失仍是原始 forecasting loss，不包含 RADAR 重建损失。启用与关闭 RADAR 时 backbone 参数名称相同，原始 iTransformer checkpoint 可以严格加载到 v5.0 模型。
+RADAR v5.1 是确定性的无参数前置模块。训练损失仍是原始 forecasting loss，不包含 RADAR 重建损失。启用与关闭 RADAR 时 backbone 参数名称相同，原始 iTransformer checkpoint 可以严格加载到 v5.1 模型。
 
-v5.0 的实验目录后缀是 `_RADAR_v5`。从旧 v4 命令迁移时，应删除原有的绝对阈值选项。旧 RADAR v1 checkpoint 若包含 `radar.imputer.*`，这些键在 v5.0 中没有对应组件；迁移时应丢弃旧 Imputer 键，并重新评估或训练 backbone。
+v5.1 的实验目录后缀是 `_RADAR_v5_1`。从旧 v4 命令迁移时，应删除原有的绝对阈值选项。旧 RADAR v1 checkpoint 若包含 `radar.imputer.*`，这些键在 v5.1 中没有对应组件；迁移时应丢弃旧 Imputer 键，并重新评估或训练 backbone。
 
 输入必须是有限浮点观测。检测到 NaN 或 Inf 时模块会直接报错，避免无效值污染整块。缺失值应在数据预处理阶段按数据集定义编码。
 
-实例级 Min-Max 会在每个风险不完全相同的序列中产生至少一个相对高强度块，即使该序列整体健康。它解决了绝对阈值无法触发的问题，也改变了 v4 的保守性假设。分布变化仍不必然代表错误观测，完整历史均值也可能滞后于真实趋势，因此需要分别报告干净预测精度、受扰动鲁棒性、各 Chunk 的强度分布和实际触发幅度。
+实例级 Min-Max 仍会在每个风险不完全相同的序列中产生一个相对最高块，但原始风险校准会把健康序列的实际修复幅度压回低水平。分布变化仍不必然代表错误观测，完整历史均值也可能滞后于真实趋势，因此需要分别报告干净预测精度、受扰动鲁棒性、各 Chunk 的原始风险、相对风险和最终修复强度。
 
 本地测试：
 
