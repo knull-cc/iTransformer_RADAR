@@ -1,4 +1,4 @@
-"""RADAR v4.0: confidence-gated distribution-level affine repair."""
+"""RADAR v5.0: instance-normalized, risk-adaptive affine repair."""
 
 import math
 
@@ -32,19 +32,20 @@ def geometric_chunk_lengths(seq_len):
 
 
 class RADAR(nn.Module):
-    """Filter chunks whose risk exceeds a confidence threshold.
+    """Identify relatively risky chunks and repair them in observation space.
 
     Risk combines a fixed recency prior with a local, trend-aware Gaussian
-    distribution comparison. Gated chunks retain their standardized temporal
-    shape while their first two moments are moved toward the global history
-    statistics according to the risk score. The module has no trainable
-    parameters, ranking step, masks, or imputer.
+    distribution comparison. Risk is min-max normalized over the chunks of
+    each sample and variate. The resulting soft strength moves every chunk's
+    first two moments toward the global history statistics while preserving
+    its standardized temporal shape. The safest chunk has zero strength. The
+    module has no trainable parameters, ranking step, hard gate, or imputer.
     """
 
-    def __init__(self, seq_len, risk_threshold=0.75, receptive_field=8,
-                 anchor_window=32,
+    def __init__(self, seq_len, receptive_field=8, anchor_window=32,
                  dependency_decay=3.0, gamma=1.0, mean_weight=0.01,
-                 variance_weight=1.0, repair_epsilon=1e-5,
+                 variance_weight=1.0, risk_normalization_epsilon=1e-5,
+                 repair_epsilon=1e-5,
                  store_diagnostics=False):
         super().__init__()
         if not isinstance(receptive_field, int) or receptive_field < 1:
@@ -52,11 +53,11 @@ class RADAR(nn.Module):
         if not isinstance(anchor_window, int) or anchor_window < 1:
             raise ValueError("RADAR anchor_window must be a positive integer")
         scalar_settings = {
-            "risk_threshold": risk_threshold,
             "dependency_decay": dependency_decay,
             "gamma": gamma,
             "mean_weight": mean_weight,
             "variance_weight": variance_weight,
+            "risk_normalization_epsilon": risk_normalization_epsilon,
             "repair_epsilon": repair_epsilon,
         }
         try:
@@ -66,25 +67,23 @@ class RADAR(nn.Module):
             settings_are_finite = False
         if not settings_are_finite:
             raise ValueError("RADAR scalar settings must be finite real numbers")
-        if not 0 <= risk_threshold <= 1:
-            raise ValueError("RADAR risk_threshold must be between 0 and 1")
         if dependency_decay <= 0 or gamma <= 0:
             raise ValueError("RADAR decay and gamma must be positive")
         if mean_weight < 0 or variance_weight <= 0:
             raise ValueError("RADAR statistical weights are invalid")
-        if repair_epsilon <= 0:
-            raise ValueError("RADAR repair epsilon must be positive")
+        if risk_normalization_epsilon <= 0 or repair_epsilon <= 0:
+            raise ValueError("RADAR numerical epsilons must be positive")
 
         self.seq_len = seq_len
         self.chunk_lengths = geometric_chunk_lengths(seq_len)
         self.num_chunks = len(self.chunk_lengths)
-        self.risk_threshold = float(risk_threshold)
         self.receptive_field = receptive_field
         self.anchor_window = anchor_window
         self.dependency_decay = float(dependency_decay)
         self.gamma = float(gamma)
         self.mean_weight = float(mean_weight)
         self.variance_weight = float(variance_weight)
+        self.risk_normalization_epsilon = float(risk_normalization_epsilon)
         self.repair_epsilon = float(repair_epsilon)
         self.store_diagnostics = bool(store_diagnostics)
 
@@ -183,7 +182,7 @@ class RADAR(nn.Module):
             mean = window.mean(dim=1)
             centered = window - mean.unsqueeze(1)
             variance = centered.square().mean(dim=1)
-            standard_deviation = torch.sqrt(variance)
+            standard_deviation = self._safe_sqrt(variance)
 
             if end - start > 1:
                 length = end - start
@@ -201,7 +200,7 @@ class RADAR(nn.Module):
                     torch.zeros_like(residual_variance),
                     residual_variance,
                 )
-                residual_standard_deviation = torch.sqrt(residual_variance)
+                residual_standard_deviation = self._safe_sqrt(residual_variance)
             else:
                 slope = torch.zeros_like(standard_deviation)
                 residual_standard_deviation = torch.zeros_like(standard_deviation)
@@ -227,9 +226,6 @@ class RADAR(nn.Module):
         tiny = torch.finfo(numerator.dtype).tiny
         ratio = numerator / denominator.clamp_min(tiny)
         return torch.where(denominator > 0, ratio, torch.zeros_like(ratio))
-
-    def _point_mask(self, blocks):
-        return blocks[:, self.block_ids, :]
 
     def _score(self, values, detailed=False):
         local_statistics = self._window_statistics(
@@ -297,7 +293,7 @@ class RADAR(nn.Module):
             "reliability": reliability,
             "risk": risk,
             "risk_distance": risk_distance,
-            "wasserstein_distance": torch.sqrt(wasserstein_sq),
+            "wasserstein_distance": self._safe_sqrt(wasserstein_sq),
             "wasserstein_squared": wasserstein_sq,
             "mean_distance": mean_distance,
             "variance_distance": variance_distance,
@@ -313,19 +309,32 @@ class RADAR(nn.Module):
             "anchor_valid": anchor_valid.expand_as(reliability),
         }
 
-    def _gate(self, risk):
-        return risk > self.risk_threshold
+    def _normalize_risk(self, risk):
+        """Normalize risk over chunks independently per sample and variate."""
+        risk_min = risk.amin(dim=1, keepdim=True)
+        risk_max = risk.amax(dim=1, keepdim=True)
+        risk_span = risk_max - risk_min
+        normalized_risk = (
+            (risk - risk_min)
+            / (risk_span + self.risk_normalization_epsilon)
+        )
+        return normalized_risk, risk_min, risk_max
 
     @staticmethod
-    def _standard_deviation(centered):
+    def _safe_sqrt(nonnegative):
+        """Square root with a finite zero derivative at an exact zero."""
+        tiny = torch.finfo(nonnegative.dtype).tiny
+        return torch.where(
+            nonnegative > 0,
+            torch.sqrt(nonnegative.clamp_min(tiny)),
+            torch.zeros_like(nonnegative),
+        )
+
+    @classmethod
+    def _standard_deviation(cls, centered):
         """Population standard deviation with a finite gradient at zero."""
         variance = centered.square().mean(dim=1, keepdim=True)
-        tiny = torch.finfo(centered.dtype).tiny
-        return torch.where(
-            variance > 0,
-            torch.sqrt(variance.clamp_min(tiny)),
-            torch.zeros_like(variance),
-        )
+        return cls._safe_sqrt(variance)
 
     def _chunk_statistics(self, values):
         """Compute true-chunk population moments without a chunk loop."""
@@ -339,45 +348,48 @@ class RADAR(nn.Module):
         squared_totals = torch.matmul(
             centered.square().transpose(1, 2), membership).transpose(1, 2)
         variance = squared_totals / sizes
-        tiny = torch.finfo(values.dtype).tiny
-        chunk_std = torch.where(
-            variance > 0,
-            torch.sqrt(variance.clamp_min(tiny)),
-            torch.zeros_like(variance),
-        )
+        chunk_std = self._safe_sqrt(variance)
         return chunk_mean, chunk_std
 
-    def _repair(self, values, risk, selected):
-        """Apply risk-conditioned distribution-level affine repair."""
+    def _repair(self, values, normalized_risk):
+        """Apply instance-normalized distribution-level affine repair."""
         chunk_mean, chunk_std = self._chunk_statistics(values)
 
         global_mean = values.mean(dim=1, keepdim=True)
         global_std = self._standard_deviation(values - global_mean)
 
-        # A zero effective score makes the diagnostic target moments equal to
-        # the original chunk moments. The final point mask below still provides
-        # bit-exact identity for every chunk that did not pass the hard gate.
-        effective_risk = torch.where(selected, risk, torch.zeros_like(risk))
         safe_mean = (
-            (1 - effective_risk) * chunk_mean
-            + effective_risk * global_mean
+            (1 - normalized_risk) * chunk_mean
+            + normalized_risk * global_mean
         )
         safe_std = (
-            (1 - effective_risk) * chunk_std
-            + effective_risk * global_std
+            (1 - normalized_risk) * chunk_std
+            + normalized_risk * global_std
         )
 
         point_chunk_mean = chunk_mean[:, self.block_ids, :]
         point_chunk_std = chunk_std[:, self.block_ids, :]
+        standardization_scale = torch.where(
+            point_chunk_std > 0,
+            point_chunk_std,
+            torch.full_like(point_chunk_std, self.repair_epsilon),
+        )
         standardized = (
             (values - point_chunk_mean)
-            / (point_chunk_std + self.repair_epsilon)
+            / standardization_scale
         )
-        point_safe_mean = safe_mean[:, self.block_ids, :]
-        point_safe_std = safe_std[:, self.block_ids, :]
-        repaired = standardized * point_safe_std + point_safe_mean
+        point_repair_strength = normalized_risk[:, self.block_ids, :]
+
+        # This correction form is algebraically identical to
+        # Z * sigma_safe + mu_safe. Starting from `values` makes zero-strength
+        # chunks an exact identity mapping instead of reconstructing them with
+        # avoidable floating-point roundoff.
+        correction = (
+            standardized * (global_std - point_chunk_std)
+            + (global_mean - point_chunk_mean)
+        )
+        repaired = values + point_repair_strength * correction
         return repaired, {
-            "effective_risk": effective_risk,
             "chunk_mean": chunk_mean,
             "chunk_std": chunk_std,
             "global_mean": global_mean,
@@ -385,6 +397,7 @@ class RADAR(nn.Module):
             "safe_mean": safe_mean,
             "safe_std": safe_std,
             "standardized": standardized,
+            "point_repair_strength": point_repair_strength,
         }
 
     @staticmethod
@@ -405,25 +418,22 @@ class RADAR(nn.Module):
         original_dtype = x.dtype
         statistics = x if x.dtype in (torch.float32, torch.float64) else x.float()
         with torch.autocast(device_type=x.device.type, enabled=False):
-            with torch.no_grad():
-                score = self._score(statistics, detailed=self.store_diagnostics)
-                diagnostics = score if self.store_diagnostics else None
-                risk = diagnostics["risk"] if diagnostics is not None else score
-                selected = self._gate(risk)
-                repair_mask = self._point_mask(selected)
-
-            affine_repaired, repair_diagnostics = self._repair(
-                statistics, risk, selected)
-        repaired = torch.where(
-            repair_mask, affine_repaired.to(original_dtype), x)
+            score = self._score(statistics, detailed=self.store_diagnostics)
+            diagnostics = score if self.store_diagnostics else None
+            risk = diagnostics["risk"] if diagnostics is not None else score
+            normalized_risk, risk_min, risk_max = self._normalize_risk(risk)
+            repaired, repair_diagnostics = self._repair(
+                statistics, normalized_risk)
+        repaired = repaired.to(original_dtype)
 
         if self.store_diagnostics:
             self.last_diagnostics = {
                 **{name: value.detach() for name, value in diagnostics.items()},
                 **{name: value.detach()
                    for name, value in repair_diagnostics.items()},
-                "selected_blocks": selected.detach(),
-                "repair_mask": repair_mask.detach(),
+                "normalized_risk": normalized_risk.detach(),
+                "risk_min": risk_min.detach(),
+                "risk_max": risk_max.detach(),
             }
         else:
             self.last_diagnostics = None

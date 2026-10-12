@@ -86,16 +86,12 @@ if __name__ == '__main__':
     parser.add_argument('--use_norm', type=int, default=True, help='use norm and denorm')
     parser.add_argument('--use_radar', type=int, choices=[0, 1], nargs='?', const=1, default=0,
                         help='enable RADAR input repair for iTransformer (default: 0)')
-    parser.add_argument('--risk_threshold', type=float, default=0.75,
-                        help='RADAR repair threshold in [0, 1] (default: 0.75)')
     parser.add_argument('--partial_start_index', type=int, default=0, help='the start index of variates for partial training, '
                                                                            'you can select [partial_start_index, min(enc_in + partial_start_index, N)]')
 
     args = parser.parse_args()
     if args.use_radar and args.model != 'iTransformer':
         parser.error('--use_radar currently supports --model iTransformer')
-    if not 0 <= args.risk_threshold <= 1:
-        parser.error('--risk_threshold must be between 0 and 1')
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
     if args.use_gpu and args.use_multi_gpu:
@@ -136,7 +132,7 @@ if __name__ == '__main__':
                 args.class_strategy, ii)
 
             if args.use_radar:
-                setting += f'_RADAR_v4_rt{args.risk_threshold:g}'
+                setting += '_RADAR_v5'
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -172,7 +168,7 @@ if __name__ == '__main__':
             args.class_strategy, ii)
 
         if args.use_radar:
-            setting += f'_RADAR_v4_rt{args.risk_threshold:g}'
+            setting += '_RADAR_v5'
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))

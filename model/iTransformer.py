@@ -40,10 +40,7 @@ class Model(nn.Module):
 
         # Construct after the backbone so its initialization stays identical.
         self.radar = (
-            RADAR(
-                configs.seq_len,
-                risk_threshold=getattr(configs, 'risk_threshold', 0.75),
-            )
+            RADAR(configs.seq_len)
             if getattr(configs, 'use_radar', False)
             else None
         )

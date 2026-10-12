@@ -1,4 +1,4 @@
-"""Behavioral tests for the lightweight RADAR v4.0 input filter."""
+"""Behavioral tests for the lightweight RADAR v5.0 input filter."""
 
 import unittest
 from types import SimpleNamespace
@@ -15,7 +15,7 @@ def config(**changes):
                   d_model=16, embed='timeF', freq='h', dropout=0.25,
                   class_strategy='projection', factor=1, n_heads=2,
                   d_ff=32, activation='gelu', e_layers=1, features='M',
-                  use_radar=True, risk_threshold=0.75)
+                  use_radar=True)
     values.update(changes)
     return SimpleNamespace(**values)
 
@@ -66,14 +66,14 @@ class ChunkingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 geometric_chunk_lengths(length)
         invalid = [
-            dict(risk_threshold=-0.01), dict(risk_threshold=1.01),
             dict(receptive_field=0), dict(anchor_window=0),
             dict(dependency_decay=0), dict(gamma=0), dict(mean_weight=-1),
-            dict(variance_weight=0), dict(repair_epsilon=0),
+            dict(variance_weight=0), dict(risk_normalization_epsilon=0),
+            dict(repair_epsilon=0),
         ]
         for setting in [
-                'risk_threshold', 'dependency_decay', 'gamma', 'mean_weight',
-                'variance_weight', 'repair_epsilon']:
+                'dependency_decay', 'gamma', 'mean_weight', 'variance_weight',
+                'risk_normalization_epsilon', 'repair_epsilon']:
             for value in [float('nan'), float('inf'), float('-inf')]:
                 invalid.append({setting: value})
         for arguments in invalid:
@@ -82,26 +82,38 @@ class ChunkingTests(unittest.TestCase):
 
 
 class RiskAndRepairTests(unittest.TestCase):
-    def test_confidence_gate_is_strict_and_has_no_top_k_cap(self):
-        radar = diagnostic_radar(96, risk_threshold=0.75)
-        risk = torch.tensor(
-            [[[0.00], [0.75], [0.76], [0.77], [0.80], [0.90], [1.00], [0.10]]])
+    def test_risk_is_min_max_normalized_per_instance_and_variate(self):
+        radar = diagnostic_radar(96)
+        risk = torch.tensor([
+            [[0.2, 4.0], [0.3, 2.0], [0.8, 8.0], [0.5, 6.0]],
+            [[9.0, 0.4], [3.0, 0.1], [6.0, 0.7], [0.0, 1.0]],
+        ], dtype=torch.float64)
 
-        selected = radar._gate(risk)
+        normalized, risk_min, risk_max = radar._normalize_risk(risk)
+        expected_min = risk.amin(dim=1, keepdim=True)
+        expected_max = risk.amax(dim=1, keepdim=True)
+        expected = (
+            (risk - expected_min)
+            / (expected_max - expected_min + radar.risk_normalization_epsilon)
+        )
 
-        torch.testing.assert_close(selected, risk > 0.75)
-        self.assertEqual(selected.sum().item(), 5)
+        torch.testing.assert_close(risk_min, expected_min)
+        torch.testing.assert_close(risk_max, expected_max)
+        torch.testing.assert_close(normalized, expected)
+        torch.testing.assert_close(
+            normalized.amin(dim=1), torch.zeros_like(normalized[:, 0]))
+        self.assertTrue((normalized >= 0).all())
+        self.assertTrue((normalized < 1).all())
 
-    def test_all_scores_below_threshold_produce_exact_identity_mapping(self):
-        radar = diagnostic_radar(96, risk_threshold=0.75)
-        history = smooth_history()
+    def test_equal_chunk_risks_normalize_to_zero(self):
+        radar = diagnostic_radar(96)
+        risk = torch.full((2, radar.num_chunks, 3), 0.42)
 
-        repaired = radar(history)
-        diagnostics = radar.last_diagnostics
+        normalized, risk_min, risk_max = radar._normalize_risk(risk)
 
-        self.assertTrue((diagnostics['risk'] <= radar.risk_threshold).all())
-        self.assertFalse(diagnostics['selected_blocks'].any())
-        torch.testing.assert_close(repaired, history, rtol=0, atol=0)
+        torch.testing.assert_close(normalized, torch.zeros_like(normalized))
+        torch.testing.assert_close(risk_min, risk[:, :1])
+        torch.testing.assert_close(risk_max, risk[:, :1])
 
     def test_recent_short_chunk_statistics_use_the_expanded_receptive_field(self):
         radar = diagnostic_radar(96)
@@ -175,7 +187,7 @@ class RiskAndRepairTests(unittest.TestCase):
                 atol=1e-3,
             )
 
-    def test_clean_periodic_signal_is_not_aggressively_smoothed(self):
+    def test_periodic_signals_receive_bounded_instance_relative_strengths(self):
         radar = diagnostic_radar(96)
         time = torch.arange(96, dtype=torch.float32)
         frequencies = torch.tensor([0.05, 0.1, 0.15, 0.20678, 0.3, 0.45, 0.6])
@@ -186,18 +198,25 @@ class RiskAndRepairTests(unittest.TestCase):
         ).reshape(-1, 96, 1)
 
         repaired = radar(history)
+        normalized_risk = radar.last_diagnostics['normalized_risk']
 
-        self.assertLess((repaired - history).abs().max().item(), 0.02)
+        self.assertTrue(torch.isfinite(repaired).all())
+        self.assertTrue((normalized_risk >= 0).all())
+        self.assertTrue((normalized_risk < 1).all())
+        torch.testing.assert_close(
+            normalized_risk.amin(dim=1),
+            torch.zeros_like(normalized_risk[:, 0]),
+        )
+        self.assertTrue((normalized_risk.amax(dim=1) > 0).all())
 
     def test_affine_repair_matches_the_distribution_level_formula(self):
         torch.manual_seed(17)
         radar = diagnostic_radar(96)
         history = torch.randn(2, 96, 3, dtype=torch.float64)
-        risk = torch.linspace(0.1, 0.8, radar.num_chunks, dtype=torch.float64)
-        risk = risk.view(1, -1, 1).expand(2, -1, 3).clone()
-        selected = torch.ones_like(risk, dtype=torch.bool)
+        strength = torch.linspace(0.0, 0.9, radar.num_chunks, dtype=torch.float64)
+        strength = strength.view(1, -1, 1).expand(2, -1, 3).clone()
 
-        repaired, diagnostics = radar._repair(history, risk, selected)
+        repaired, diagnostics = radar._repair(history, strength)
 
         expected_global_mean = history.mean(dim=1, keepdim=True)
         expected_global_std = history.std(dim=1, keepdim=True, unbiased=False)
@@ -205,18 +224,20 @@ class RiskAndRepairTests(unittest.TestCase):
             diagnostics['global_mean'], expected_global_mean)
         torch.testing.assert_close(
             diagnostics['global_std'], expected_global_std)
-        torch.testing.assert_close(diagnostics['effective_risk'], risk)
+        torch.testing.assert_close(
+            diagnostics['point_repair_strength'],
+            strength[:, radar.block_ids, :],
+        )
         for index, (start, end) in enumerate(radar.chunk_bounds):
             chunk = history[:, start:end, :]
             chunk_mean = chunk.mean(dim=1, keepdim=True)
             chunk_std = chunk.std(dim=1, keepdim=True, unbiased=False)
-            score = risk[:, index:index + 1, :]
+            score = strength[:, index:index + 1, :]
             safe_mean = (
                 (1 - score) * chunk_mean + score * expected_global_mean)
             safe_std = (
                 (1 - score) * chunk_std + score * expected_global_std)
-            standardized = (
-                (chunk - chunk_mean) / (chunk_std + radar.repair_epsilon))
+            standardized = (chunk - chunk_mean) / chunk_std
             expected = standardized * safe_std + safe_mean
 
             torch.testing.assert_close(
@@ -231,13 +252,12 @@ class RiskAndRepairTests(unittest.TestCase):
                 diagnostics['standardized'][:, start:end, :], standardized)
             torch.testing.assert_close(repaired[:, start:end, :], expected)
 
-    def test_selected_singleton_chunk_is_finite_and_keeps_its_value(self):
+    def test_singleton_chunk_repair_is_finite_and_keeps_its_value(self):
         radar = diagnostic_radar(1)
         history = torch.tensor([[[3.5], [-2.0]]]).transpose(0, 1)
-        risk = torch.full((2, 1, 1), 0.9)
-        selected = torch.ones_like(risk, dtype=torch.bool)
+        strength = torch.full((2, 1, 1), 0.9)
 
-        repaired, diagnostics = radar._repair(history, risk, selected)
+        repaired, diagnostics = radar._repair(history, strength)
 
         torch.testing.assert_close(
             diagnostics['chunk_std'], torch.zeros_like(diagnostics['chunk_std']))
@@ -246,7 +266,7 @@ class RiskAndRepairTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(repaired).all())
         torch.testing.assert_close(repaired, history, rtol=0, atol=0)
 
-    def test_gated_chunk_is_reconstructed_with_risk_fused_global_moments(self):
+    def test_relatively_risky_chunk_uses_normalized_risk_fused_moments(self):
         radar = diagnostic_radar(96)
         history = (torch.arange(96, dtype=torch.float32) / 10).view(1, 96, 1)
         history[:, 88:92, 0] += torch.tensor([0., 100., -100., 0.])
@@ -258,16 +278,20 @@ class RiskAndRepairTests(unittest.TestCase):
         block_index = 5
         start, end = radar.chunk_bounds[block_index]
         self.assertEqual((start, end), (88, 92))
-        self.assertTrue(diagnostics['selected_blocks'][0, block_index, 0])
-        torch.testing.assert_close(
-            diagnostics['selected_blocks'],
-            diagnostics['risk'] > radar.risk_threshold,
-        )
         torch.testing.assert_close(
             diagnostics['risk'],
             diagnostics['dependency'] * (1 - diagnostics['reliability']),
         )
-        score = diagnostics['risk'][:, block_index:block_index + 1, :]
+        expected_normalized = (
+            (diagnostics['risk'] - diagnostics['risk_min'])
+            / (diagnostics['risk_max'] - diagnostics['risk_min']
+               + radar.risk_normalization_epsilon)
+        )
+        torch.testing.assert_close(
+            diagnostics['normalized_risk'], expected_normalized)
+        score = diagnostics['normalized_risk'][:, block_index:block_index + 1, :]
+        self.assertGreater(score.item(), 0.8)
+        self.assertGreater(diagnostics['normalized_risk'][:, -1].item(), 0.99)
         chunk = original[:, start:end, :]
         chunk_mean = chunk.mean(dim=1, keepdim=True)
         chunk_std = chunk.std(dim=1, keepdim=True, unbiased=False)
@@ -275,8 +299,7 @@ class RiskAndRepairTests(unittest.TestCase):
         global_std = original.std(dim=1, keepdim=True, unbiased=False)
         safe_mean = (1 - score) * chunk_mean + score * global_mean
         safe_std = (1 - score) * chunk_std + score * global_std
-        standardized = (
-            (chunk - chunk_mean) / (chunk_std + radar.repair_epsilon))
+        standardized = (chunk - chunk_mean) / chunk_std
         expected = standardized * safe_std + safe_mean
 
         torch.testing.assert_close(
@@ -292,9 +315,13 @@ class RiskAndRepairTests(unittest.TestCase):
         torch.testing.assert_close(
             diagnostics['safe_std'][:, block_index:block_index + 1], safe_std)
         torch.testing.assert_close(repaired[:, start:end], expected)
+
+        safest = diagnostics['normalized_risk'].argmin(dim=1, keepdim=True)
+        point_blocks = radar.block_ids.view(1, -1, 1).expand_as(original)
+        identity_mask = point_blocks == safest.expand_as(original)
         torch.testing.assert_close(
-            repaired[~diagnostics['repair_mask']],
-            original[~diagnostics['repair_mask']],
+            repaired[identity_mask],
+            original[identity_mask],
             rtol=0,
             atol=0,
         )
@@ -304,15 +331,43 @@ class RiskAndRepairTests(unittest.TestCase):
         torch.manual_seed(23)
         radar = RADAR(96)
         history = torch.randn(2, 96, 3, dtype=torch.float64, requires_grad=True)
-        risk = torch.linspace(0.1, 0.9, radar.num_chunks, dtype=torch.float64)
-        risk = risk.view(1, -1, 1).expand(2, -1, 3)
-        selected = torch.ones_like(risk, dtype=torch.bool)
+        strength = torch.linspace(0.0, 0.9, radar.num_chunks, dtype=torch.float64)
+        strength = strength.view(1, -1, 1).expand(2, -1, 3)
 
-        repaired, _ = radar._repair(history, risk, selected)
+        repaired, _ = radar._repair(history, strength)
         weights = torch.linspace(
             0.5, 1.5, repaired.numel(), dtype=repaired.dtype).reshape_as(repaired)
         (repaired * weights).sum().backward()
 
+        self.assertIsNotNone(history.grad)
+        self.assertTrue(torch.isfinite(history.grad).all())
+        self.assertGreater(history.grad.abs().sum().item(), 0)
+
+    def test_end_to_end_soft_repair_has_finite_input_gradients(self):
+        torch.manual_seed(29)
+        radar = RADAR(96)
+        history = torch.randn(2, 96, 3, dtype=torch.float64)
+        history[:, -8:, 0] *= 6
+        history.requires_grad_()
+
+        repaired = radar(history)
+        weights = torch.linspace(
+            0.5, 1.5, repaired.numel(), dtype=repaired.dtype).reshape_as(repaired)
+        (repaired * weights).sum().backward()
+
+        self.assertIsNotNone(history.grad)
+        self.assertTrue(torch.isfinite(history.grad).all())
+        self.assertGreater(history.grad.abs().sum().item(), 0)
+
+    def test_constant_identity_has_finite_input_gradients(self):
+        radar = RADAR(96)
+        history = torch.full(
+            (2, 96, 3), 7.0, dtype=torch.float64, requires_grad=True)
+
+        repaired = radar(history)
+        repaired.square().sum().backward()
+
+        torch.testing.assert_close(repaired, history, rtol=0, atol=0)
         self.assertIsNotNone(history.grad)
         self.assertTrue(torch.isfinite(history.grad).all())
         self.assertGreater(history.grad.abs().sum().item(), 0)
@@ -323,10 +378,13 @@ class RiskAndRepairTests(unittest.TestCase):
         history[:, -8:, 0] += torch.tensor(
             [10., -10., 10., -10., 10., -10., 10., -10.])
         repaired = radar(history)
-        selected = radar.last_diagnostics['selected_blocks']
+        normalized_risk = radar.last_diagnostics['normalized_risk']
 
-        self.assertTrue(selected[:, -1, 0].all())
-        self.assertFalse(selected[:, :, 1:].any())
+        self.assertTrue((normalized_risk[:, -1, 0] > 0.99).all())
+        torch.testing.assert_close(
+            normalized_risk[:, :, 1:],
+            torch.zeros_like(normalized_risk[:, :, 1:]),
+        )
         torch.testing.assert_close(repaired[:, :, 1:], history[:, :, 1:], rtol=0, atol=0)
 
     def test_constant_and_singleton_inputs_are_noops(self):
@@ -335,10 +393,13 @@ class RiskAndRepairTests(unittest.TestCase):
             history = torch.full((2, length, 3), 7.)
             repaired = radar(history)
             torch.testing.assert_close(repaired, history, rtol=0, atol=0)
-            self.assertFalse(radar.last_diagnostics['repair_mask'].any())
+            torch.testing.assert_close(
+                radar.last_diagnostics['normalized_risk'],
+                torch.zeros_like(radar.last_diagnostics['normalized_risk']),
+            )
             self.assertTrue(torch.isfinite(radar.last_diagnostics['risk']).all())
 
-    def test_unselected_values_keep_original_precision_and_diagnostics_are_detached(self):
+    def test_zero_strength_values_keep_precision_and_diagnostics_are_detached(self):
         radar = diagnostic_radar(96)
         history = smooth_history().double() + 1e-10
         history[:, -8:, 0] += torch.tensor(
@@ -347,15 +408,12 @@ class RiskAndRepairTests(unittest.TestCase):
         diagnostics = radar.last_diagnostics
 
         self.assertEqual(repaired.dtype, history.dtype)
+        zero_strength = diagnostics['point_repair_strength'] == 0
         torch.testing.assert_close(
-            repaired[~diagnostics['repair_mask']],
-            history[~diagnostics['repair_mask']],
+            repaired[zero_strength],
+            history[zero_strength],
             rtol=0,
             atol=0,
-        )
-        torch.testing.assert_close(
-            diagnostics['selected_blocks'],
-            diagnostics['risk'] > radar.risk_threshold,
         )
         self.assertTrue(all(not value.requires_grad for value in diagnostics.values()))
 
@@ -409,7 +467,7 @@ class BackboneIntegrationTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_enabled_model_runs_one_backbone_pass_and_adds_no_parameters(self):
-        model = Model(config(risk_threshold=0.8)).eval()
+        model = Model(config()).eval()
         backbone_calls = []
         handle = model.enc_embedding.register_forward_hook(
             lambda module, inputs, output: backbone_calls.append(1))
@@ -421,7 +479,6 @@ class BackboneIntegrationTests(unittest.TestCase):
 
         self.assertEqual(prediction.shape, (4, 12, 3))
         self.assertEqual(backbone_calls, [1])
-        self.assertEqual(model.radar.risk_threshold, 0.8)
         self.assertEqual(sum(parameter.numel() for parameter in model.radar.parameters()), 0)
         self.assertIsNone(model.radar.last_diagnostics)
 
