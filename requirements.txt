@@ -1,6 +1,9 @@
-pandas==1.5.3
-scikit-learn==1.2.2
-numpy==1.23.5
-matplotlib==3.7.0
-torch==2.0.0
+# Python 3.12 / current Colab. Satisfied packages, including Colab's CUDA
+# PyTorch build, are reused by pip; avoid --upgrade unless it is required.
+pandas>=2.2.3,<3.0
+scikit-learn>=1.5,<2.0
+numpy>=1.26.4,<3.0
+matplotlib>=3.9,<4.0
+torch>=2.6,<3.0
+einops>=0.8,<1.0
 reformer-pytorch==1.4.4

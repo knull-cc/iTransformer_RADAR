@@ -1,4 +1,8 @@
-export CUDA_VISIBLE_DEVICES=1
+#!/usr/bin/env bash
+set -e
+
+# Colab exposes its single GPU as device 0; allow an explicit device override.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 model_name=iTransformer
 
@@ -19,7 +23,7 @@ python -u run.py \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
-  --itr 1
+  --itr 1 "$@"
 
 python -u run.py \
   --is_training 1 \
@@ -38,7 +42,7 @@ python -u run.py \
   --des 'Exp' \
   --d_model 256 \
   --d_ff 256 \
-  --itr 1
+  --itr 1 "$@"
 
 python -u run.py \
   --is_training 1 \
@@ -57,7 +61,7 @@ python -u run.py \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
-  --itr 1
+  --itr 1 "$@"
 
 python -u run.py \
   --is_training 1 \
@@ -76,4 +80,4 @@ python -u run.py \
   --des 'Exp' \
   --d_model 512 \
   --d_ff 512 \
-  --itr 1
+  --itr 1 "$@"

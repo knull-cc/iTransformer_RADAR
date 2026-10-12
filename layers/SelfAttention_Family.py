@@ -3,7 +3,6 @@ import torch.nn as nn
 import numpy as np
 from math import sqrt
 from utils.masking import TriangularCausalMask, ProbMask
-from reformer_pytorch import LSHSelfAttention
 from einops import rearrange
 
 
@@ -304,6 +303,17 @@ class ReformerLayer(nn.Module):
     def __init__(self, attention, d_model, n_heads, d_keys=None,
                  d_values=None, causal=False, bucket_size=4, n_hashes=4):
         super().__init__()
+        # iTransformer and the other attention implementations do not need this
+        # package. Import it only when a Reformer model is actually constructed.
+        try:
+            from reformer_pytorch import LSHSelfAttention
+        except ModuleNotFoundError as error:
+            if error.name != 'reformer_pytorch':
+                raise
+            raise ModuleNotFoundError(
+                'Reformer/iReformer requires reformer_pytorch. Install it with '
+                'python -m pip install reformer-pytorch==1.4.4'
+            ) from error
         self.bucket_size = bucket_size
         self.attn = LSHSelfAttention(
             dim=d_model,

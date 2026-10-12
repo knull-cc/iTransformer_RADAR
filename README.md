@@ -68,8 +68,15 @@ The pseudo-code of iTransformer is as simple as the following:
 1. Install Pytorch and the necessary dependencies.
 
 ```
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
+
+The requirements support Python 3.12 and reuse installed packages that satisfy
+their version ranges, including Colab's CUDA-enabled PyTorch. In Colab, use
+`%pip install -r /content/iTransformer_RADAR/requirements.txt` after syncing this
+checkout. Run ETTh1 with RADAR using
+`bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --use_radar 1`.
+The ETTh1 script defaults to GPU 0 and forwards extra arguments to all four runs.
 
 1. The datasets can be obtained from [Google Drive](https://drive.google.com/file/d/1l51QsKvQPcqILT3DwfjCgx8Dsg2rpjot/view?usp=drive_link) or [Baidu Cloud](https://pan.baidu.com/s/11AWXg1Z6UwjHzmto4hesAA?pwd=9qjr).
 

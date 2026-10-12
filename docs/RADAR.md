@@ -4,6 +4,25 @@ RADAR 在 iTransformer 的归一化与 embedding **之前**执行：历史时序
 
 ## 启用
 
+推荐使用 Python 3.12；当前 `requirements.txt` 使用兼容现代 Python 的依赖范围，替代原来的 2023 年固定版本。依赖包括显式声明的 `einops` 和保留的 `reformer-pytorch==1.4.4`。使用普通 `pip install -r requirements.txt` 时，已经满足范围的包会被复用，包括 Colab 自带的 CUDA 版 PyTorch。
+
+在 Colab 中先把更新后的项目文件同步到 `/content/iTransformer_RADAR`，然后安装：
+
+```python
+%pip install -r /content/iTransformer_RADAR/requirements.txt
+```
+
+安装成功后，运行 ETTh1 四组原始配置并启用 RADAR：
+
+```python
+%cd /content/iTransformer_RADAR
+!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --use_radar 1
+```
+
+该脚本默认使用 GPU 0，保留显式设置的 `CUDA_VISIBLE_DEVICES`，向全部四次运行转发附加参数，并在首次失败时停止。四组预测长度、模型维度和其他原有训练参数保持原样；不传附加参数时 RADAR 仍默认关闭。数据文件需要放在 `/content/iTransformer_RADAR/dataset/ETT-small/ETTh1.csv`。
+
+运行 iTransformer 不再强制加载 Reformer 包；只有构造 `Reformer` / `iReformer` 时才加载。如果缺少该包，错误会给出安装命令。数据加载器也使用 pandas 2.x 支持的 `drop(columns=...)` 写法。
+
 在原有命令末尾添加 `--use_radar 1` 即可；也支持简写 `--use_radar`。默认 `--use_radar 0`，关闭时不创建补全器，原有 backbone 参数名称、初始化顺序和预测计算保持一致。此开关目前仅支持 `--model iTransformer`。
 
 ```bash
