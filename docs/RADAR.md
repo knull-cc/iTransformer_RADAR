@@ -1,8 +1,8 @@
-# RADAR v2.1：置信度门控与软残差抑制
+# RADAR v3.0：置信度门控与动量保留演化分解
 
-RADAR v2.1 是 iTransformer 的可选前置滤波器。它在原始观测空间执行：非等距切块 → 近期依赖先验 → 局部分布可靠性 → 风险阈值门控 → 块内残差软抑制 → iTransformer。
+RADAR v3.0 是 iTransformer 的可选前置滤波器。它在原始观测空间执行：非等距切块 → 近期依赖先验 → 局部分布可靠性 → 风险阈值门控 → 动量保留演化分解 → iTransformer。
 
-v2.1 保持 v2 的切块、统计、风险打分和修复公式不变，只将强制 Top-3 排名替换为置信度门控。它已完全移除梯度显著性、Attention 依赖分数、Hard Mask、Masked MLP Imputer 和重建辅助损失。启用后每个 batch 只执行一次 forecasting backbone；RADAR 本身没有可训练参数，也不会用未来标签或 decoder 的未来占位值。
+v3.0 完整保留 v2.1 的切块、统计、风险打分和置信度门控，只替换修复内核：每个触发块由首尾点估计速度，以线性演化轨迹替代块均值作为基线，再对轨迹周围的平稳残差进行阻尼。它已完全移除梯度显著性、Attention 依赖分数、Hard Mask、Masked MLP Imputer 和重建辅助损失。启用后每个 batch 只执行一次 forecasting backbone；RADAR 本身没有可训练参数，也不会用未来标签或 decoder 的未来占位值。
 
 ## 启用与 Colab 运行
 
@@ -19,7 +19,7 @@ v2.1 保持 v2 的切块、统计、风险打分和修复公式不变，只将�
 !bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh
 ```
 
-启用 RADAR v2.1：
+启用 RADAR v3.0：
 
 ```python
 %cd /content/iTransformer_RADAR
@@ -43,7 +43,7 @@ ETTh1 脚本依次运行预测长度为 96、192、336 和 720 的四组实验�
   --num_workers 2
 ```
 
-直接调用 `run.py` 时，全局 batch size 默认仍为 32。`--use_radar` 的默认值为 0；该开关目前只支持 `--model iTransformer`。`--risk_threshold` 的合法范围为 `[0,1]`，默认值为 0.75。启用后的 checkpoint 和结果目录带 `_RADAR_v2_1_rt<阈值>` 后缀，使不同阈值的消融实验彼此隔离，也避免与 v2 产物冲突。
+直接调用 `run.py` 时，全局 batch size 默认仍为 32。`--use_radar` 的默认值为 0；该开关目前只支持 `--model iTransformer`。`--risk_threshold` 的合法范围为 `[0,1]`，默认值为 0.75。启用后的 checkpoint 和结果目录带 `_RADAR_v3_rt<阈值>` 后缀，使不同阈值的消融实验彼此隔离，也避免与 v2/v2.1 产物冲突。
 
 ## 1. 非等距切块与扩张感受野
 
@@ -131,7 +131,7 @@ d_{\sigma,i}=\frac{[\max(v_i-v_i^A,0)]^2}{q_i},
 \operatorname{Risk}_i=D_i(1-R_i).
 \]
 
-v2.1 不再排序或限制修复块数量。对每个样本、每个变量、每个块独立应用严格阈值门控：
+v3.0 保留 v2.1 的门控方式，不排序或限制修复块数量。对每个样本、每个变量、每个块独立应用严格阈值门控：
 
 \[
 G_i=\mathbb{1}[\operatorname{Risk}_i>\tau], \qquad \tau=0.75.
@@ -139,35 +139,62 @@ G_i=\mathbb{1}[\operatorname{Risk}_i>\tau], \qquad \tau=0.75.
 
 只有 `Risk > risk_threshold` 的块会进入修复；风险恰好等于阈值时不触发。如果所有块都不超过阈值，则点级修复掩码全为 `False`，输出通过 `torch.where` 逐值保留原输入，形成严格的 Identity Mapping。门控是并行布尔张量比较，不执行排序、`topk` 或逐块 Python 循环。
 
-## 3. Soft Repair：块均值不变的残差抑制
+## 3. Velocity-Preserving Evolution Decomposition
 
-对通过门控的真实块 `C_i`，直接从原始块计算趋势和残差：
-
-\[
-T_i=\operatorname{Mean}(C_i), \qquad N_i=C_i-T_i.
-\]
-
-抑制系数使用平滑的二次指数映射：
+设通过门控的真实块为
 
 \[
-\alpha_i=\exp(-\beta\operatorname{Risk}_i^2), \qquad \beta=10,
+C_i=(x_{i,0},x_{i,1},\ldots,x_{i,\ell_i-1}),
 \]
+
+其中 $\ell_i$ 是真实块长度。首先用首尾点差分估计整个块的一阶速度：
 
 \[
-C_i^{\mathrm{repaired}}=T_i+\alpha_iN_i.
+V_i=\frac{x_{i,\ell_i-1}-x_{i,0}}{\ell_i-1}.
 \]
 
-低风险时 `alpha` 接近 1，高风险时接近 0。未通过门控的块，其 `alpha` 强制为 1，并由最终布尔掩码逐值保持原输入。由于块内残差的均值为 0，修复前后的块均值严格相同：
+然后为块内每个位置 `t` 构建线性演化基线：
 
 \[
-\operatorname{Mean}(C_i^{\mathrm{repaired}})=T_i.
+T_{i,t}=x_{i,0}+tV_i, \qquad t=0,1,\ldots,\ell_i-1.
 \]
 
-该过程没有置零、缺失 token、插值、外部模板或学习式填补；每个修复点都是原值与该块自身均值之间的软收缩。序列长度、时间顺序和数据类型保持不变，块内不会产生缺口。这里的连续性指时间轴和物理量级不断裂；给定的均值收缩公式本身不强制相邻块端点数值相等。
+平稳残差及其风险自适应阻尼为：
+
+\[
+E_{i,t}=x_{i,t}-T_{i,t},
+\qquad
+\alpha_i=1-\operatorname{Risk}_i,
+\qquad
+\widehat E_{i,t}=\alpha_iE_{i,t}.
+\]
+
+最终重构为：
+
+\[
+\widehat x_{i,t}=T_{i,t}+\widehat E_{i,t}.
+\]
+
+由于首尾点相对于该演化基线的残差严格为 0，修复后首尾点保持不变：
+
+\[
+\widehat x_{i,0}=x_{i,0}, \qquad
+\widehat x_{i,\ell_i-1}=x_{i,\ell_i-1}.
+\]
+
+因此，由首尾差定义的块级一阶动量也严格保持：
+
+\[
+\frac{\widehat x_{i,\ell_i-1}-\widehat x_{i,0}}{\ell_i-1}=V_i.
+\]
+
+未通过门控的块，其 `alpha` 强制为 1，并由最终布尔掩码逐值返回原输入。实现预先缓存块起点、终点、跨度及每个点的块内偏移，前向阶段使用 `index_select`、广播、布尔比较和 `torch.where` 完成整批计算，不执行逐块 Python 循环。
+
+长度为 1 的块定义 `V=0` 并安全地保持原值。长度为 2 的块只有首尾点，其线性演化基线与原块完全相同，因此残差恒为 0；按照上述公式，即使触发门控也不会修改这类块。这是首尾速度约束下没有内部自由度的直接结果。
 
 ## 默认内部设置
 
-v2.1 提供 `--use_radar` 开关和 `--risk_threshold` 门控阈值。其余内部默认值仍位于 `layers/RADAR.py`：
+v3.0 提供 `--use_radar` 开关和 `--risk_threshold` 门控阈值。其余内部默认值仍位于 `layers/RADAR.py`：
 
 | 设置 | 默认值 |
 | --- | ---: |
@@ -178,7 +205,7 @@ v2.1 提供 `--use_radar` 开关和 `--risk_threshold` 门控阈值。其余内�
 | 可靠性温度 `gamma` | 1.0 |
 | 均值差权重 | 0.01 |
 | 残差方差差权重 | 1.0 |
-| 软抑制强度 `beta` | 10.0 |
+| 残差阻尼 | `alpha = 1 - Risk` |
 | 可训练参数 | 0 |
 | 额外 backbone 前向/反向 | 0 |
 
@@ -195,6 +222,8 @@ dependency = diagnostics['dependency']                 # [B, K, C]
 reliability = diagnostics['reliability']               # [B, K, C]
 risk = diagnostics['risk']                             # [B, K, C]
 alpha = diagnostics['alpha']                           # [B, K, C]
+velocity = diagnostics['velocity']                     # [B, K, C]
+trend = diagnostics['trend']                           # [B, L, C]
 selected_blocks = diagnostics['selected_blocks']       # [B, K, C], bool，Risk > tau
 repair_mask = diagnostics['repair_mask']               # [B, L, C], bool
 local_mean = diagnostics['local_mean']                 # 感受野统计
@@ -214,11 +243,11 @@ model.radar.set_diagnostics(False)  # 同时释放 last_diagnostics 引用
 
 ## 训练、checkpoint 与边界
 
-RADAR v2.1 是确定性的无参数滤波器。训练损失保持为原始 forecasting loss，不包含 RADAR 重建损失。启用与关闭 RADAR 的 backbone 参数名称相同，原始 iTransformer checkpoint 可以严格加载到 v2.1 模型。
+RADAR v3.0 是确定性的无参数滤波器。训练损失保持为原始 forecasting loss，不包含 RADAR 重建损失。启用与关闭 RADAR 的 backbone 参数名称相同，原始 iTransformer checkpoint 可以严格加载到 v3.0 模型。
 
-旧 RADAR v1 checkpoint 如果包含 `radar.imputer.*`，这些键在 v2.1 中已不存在。v2.1 使用新的 `_RADAR_v2_1_rt<阈值>` 实验目录，不会覆盖旧版结果。手动迁移 v1 checkpoint 时应丢弃这些旧键并重新评估/训练 backbone；v1 的 Imputer 权重没有对应的 v2.1 组件。
+旧 RADAR v1 checkpoint 如果包含 `radar.imputer.*`，这些键在 v3.0 中已不存在。v3.0 使用新的 `_RADAR_v3_rt<阈值>` 实验目录，不会覆盖旧版结果。手动迁移 v1 checkpoint 时应丢弃这些旧键并重新评估/训练 backbone；v1 的 Imputer 权重没有对应的 v3.0 组件。
 
-输入必须是有限浮点观测；RADAR 在检测到 NaN/Inf 时会直接报错，避免一个无效值污染整个块。缺失值应在数据预处理阶段按数据集定义编码。分布变化不必然代表错误观测；新的真实高频状态也可能被平滑。`lambda`、Anchor 长度、均值权重和抑制强度仍需要在目标数据的干净场景与受扰动场景上做消融实验。
+输入必须是有限浮点观测；RADAR 在检测到 NaN/Inf 时会直接报错，避免一个无效值污染整个块。缺失值应在数据预处理阶段按数据集定义编码。分布变化不必然代表错误观测；新的真实高频状态也可能被阻尼。`lambda`、Anchor 长度、均值权重和风险阈值仍需要在目标数据的干净场景与受扰动场景上做消融实验。
 
 本地测试：
 

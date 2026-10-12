@@ -1,4 +1,4 @@
-"""Behavioral tests for the lightweight RADAR v2.1 input filter."""
+"""Behavioral tests for the lightweight RADAR v3.0 input filter."""
 
 import unittest
 from types import SimpleNamespace
@@ -69,11 +69,11 @@ class ChunkingTests(unittest.TestCase):
             dict(risk_threshold=-0.01), dict(risk_threshold=1.01),
             dict(receptive_field=0), dict(anchor_window=0),
             dict(dependency_decay=0), dict(gamma=0), dict(mean_weight=-1),
-            dict(variance_weight=0), dict(repair_strength=0),
+            dict(variance_weight=0),
         ]
         for setting in [
                 'risk_threshold', 'dependency_decay', 'gamma', 'mean_weight',
-                'variance_weight', 'repair_strength']:
+                'variance_weight']:
             for value in [float('nan'), float('inf'), float('-inf')]:
                 invalid.append({setting: value})
         for arguments in invalid:
@@ -189,17 +189,63 @@ class RiskAndRepairTests(unittest.TestCase):
 
         self.assertLess((repaired - history).abs().max().item(), 0.02)
 
-    def test_high_frequency_noise_is_softened_without_replacing_chunk_trend(self):
+    def test_velocity_repair_matches_secant_trend_and_one_minus_risk_damping(self):
+        torch.manual_seed(17)
+        radar = diagnostic_radar(96)
+        history = torch.randn(2, 96, 3, dtype=torch.float64)
+        risk = torch.linspace(0.1, 0.8, radar.num_chunks, dtype=torch.float64)
+        risk = risk.view(1, -1, 1).expand(2, -1, 3).clone()
+        selected = torch.ones_like(risk, dtype=torch.bool)
+
+        repaired, alpha, velocity, trend = radar._repair(history, risk, selected)
+
+        torch.testing.assert_close(alpha, 1 - risk)
+        for index, (start, end) in enumerate(radar.chunk_bounds):
+            length = end - start
+            first = history[:, start, :]
+            last = history[:, end - 1, :]
+            expected_velocity = (last - first) / (length - 1)
+            offsets = torch.arange(length, dtype=history.dtype).view(1, -1, 1)
+            expected_trend = first.unsqueeze(1) + expected_velocity.unsqueeze(1) * offsets
+            expected_trend[:, 0, :] = first
+            expected_trend[:, -1, :] = last
+            expected = expected_trend + alpha[:, index:index + 1, :] * (
+                history[:, start:end, :] - expected_trend)
+
+            torch.testing.assert_close(velocity[:, index, :], expected_velocity)
+            torch.testing.assert_close(trend[:, start:end, :], expected_trend)
+            torch.testing.assert_close(repaired[:, start:end, :], expected)
+            torch.testing.assert_close(
+                repaired[:, start, :], history[:, start, :], rtol=0, atol=0)
+            torch.testing.assert_close(
+                repaired[:, end - 1, :], history[:, end - 1, :], rtol=0, atol=0)
+
+    def test_selected_singleton_chunk_is_a_safe_identity(self):
+        radar = diagnostic_radar(1)
+        history = torch.tensor([[[3.5], [-2.0]]]).transpose(0, 1)
+        risk = torch.full((2, 1, 1), 0.9)
+        selected = torch.ones_like(risk, dtype=torch.bool)
+
+        repaired, alpha, velocity, trend = radar._repair(history, risk, selected)
+
+        torch.testing.assert_close(alpha, torch.full_like(alpha, 0.1))
+        torch.testing.assert_close(velocity, torch.zeros_like(velocity))
+        torch.testing.assert_close(trend, history, rtol=0, atol=0)
+        torch.testing.assert_close(repaired, history, rtol=0, atol=0)
+
+    def test_high_frequency_residual_is_damped_around_preserved_velocity(self):
         radar = diagnostic_radar(96)
         history = (torch.arange(96, dtype=torch.float32) / 10).view(1, 96, 1)
-        history[:, -8:, 0] += torch.tensor(
-            [10., -10., 10., -10., 10., -10., 10., -10.])
+        history[:, 88:92, 0] += torch.tensor([0., 100., -100., 0.])
         original = history.clone()
 
         repaired = radar(history)
         diagnostics = radar.last_diagnostics
 
-        self.assertTrue(diagnostics['selected_blocks'][0, -1, 0])
+        block_index = 5
+        start, end = radar.chunk_bounds[block_index]
+        self.assertEqual((start, end), (88, 92))
+        self.assertTrue(diagnostics['selected_blocks'][0, block_index, 0])
         torch.testing.assert_close(
             diagnostics['selected_blocks'],
             diagnostics['risk'] > radar.risk_threshold,
@@ -208,19 +254,28 @@ class RiskAndRepairTests(unittest.TestCase):
             diagnostics['risk'],
             diagnostics['dependency'] * (1 - diagnostics['reliability']),
         )
-        expected_alpha = torch.exp(-radar.repair_strength * diagnostics['risk'].square())
+        expected_alpha = 1 - diagnostics['risk']
         expected_alpha = torch.where(
             diagnostics['selected_blocks'], expected_alpha, torch.ones_like(expected_alpha))
         torch.testing.assert_close(diagnostics['alpha'], expected_alpha)
-        start, end = radar.chunk_bounds[-1]
-        trend = original[:, start:end].mean(dim=1, keepdim=True)
-        alpha = diagnostics['alpha'][:, -1:, :]
+        expected_velocity = (
+            original[:, end - 1, :] - original[:, start, :]) / (end - start - 1)
+        torch.testing.assert_close(
+            diagnostics['velocity'][:, block_index, :], expected_velocity)
+        trend = diagnostics['trend'][:, start:end, :]
+        alpha = diagnostics['alpha'][:, block_index:block_index + 1, :]
         expected = trend + alpha * (original[:, start:end] - trend)
         torch.testing.assert_close(repaired[:, start:end], expected)
-        torch.testing.assert_close(repaired[:, start:end].mean(dim=1), trend[:, 0])
+        torch.testing.assert_close(
+            repaired[:, start, :], original[:, start, :], rtol=0, atol=0)
+        torch.testing.assert_close(
+            repaired[:, end - 1, :], original[:, end - 1, :], rtol=0, atol=0)
+        original_residual = original[:, start:end] - trend
+        repaired_residual = repaired[:, start:end] - trend
+        torch.testing.assert_close(repaired_residual, alpha * original_residual)
         self.assertLess(
-            repaired[:, start:end].std(unbiased=False).item(),
-            original[:, start:end].std(unbiased=False).item() * 0.1,
+            repaired_residual.abs().max().item(),
+            original_residual.abs().max().item(),
         )
         torch.testing.assert_close(
             repaired[~diagnostics['repair_mask']],
