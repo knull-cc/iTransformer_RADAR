@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from layers.Transformer_EncDec import Encoder, EncoderLayer
 from layers.SelfAttention_Family import FullAttention, AttentionLayer
 from layers.Embed import DataEmbedding_inverted
 from layers.RADAR import RADAR
-import numpy as np
 
 
 class Model(nn.Module):
@@ -42,18 +40,13 @@ class Model(nn.Module):
 
         # Construct after the backbone so its initialization stays identical.
         self.radar = RADAR(configs.seq_len) if getattr(configs, 'use_radar', False) else None
-        self.radar_target_only = getattr(configs, 'features', 'M') == 'MS'
 
-    def _forecast_backbone(self, x_enc, x_mark_enc, x_dec, x_mark_dec, detach_mean=True):
+    def _forecast_backbone(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
         if self.use_norm:
             # Normalization from Non-stationary Transformer
-            means = x_enc.mean(1, keepdim=True)
-            if detach_mean:
-                means = means.detach()
+            means = x_enc.mean(1, keepdim=True).detach()
             x_enc = x_enc - means
             stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
-            # Input saliency and imputer training need the pre-division tensor
-            # saved by variance backward; an in-place division invalidates it.
             x_enc = x_enc / stdev
 
         _, _, N = x_enc.shape # B L N
@@ -79,30 +72,17 @@ class Model(nn.Module):
 
         return dec_out, attns
 
-    def _repair_input(self, x_enc, x_mark_enc, x_dec, x_mark_dec, return_radar_loss):
-        if self.radar is None:
-            return x_enc, x_enc.new_zeros(())
-
-        def predictor(probe_x):
-            # Clone covariates inside the grad-enabled probe, including when the
-            # caller created them as inference tensors. Future values are unused.
-            probe_marks = x_mark_enc.detach().clone() if x_mark_enc is not None else None
-            forecast = self._forecast_backbone(probe_x, probe_marks, None, None, detach_mean=False)[0]
-            return forecast[:, :, -1:] if self.radar_target_only else forecast
-
-        return self.radar(x_enc, predictor, self, compute_reconstruction_loss=return_radar_loss)
+    def _repair_input(self, x_enc):
+        return x_enc if self.radar is None else self.radar(x_enc)
 
     def forecast(self, x_enc, x_mark_enc, x_dec, x_mark_dec):
-        repaired, _ = self._repair_input(x_enc, x_mark_enc, x_dec, x_mark_dec, False)
+        repaired = self._repair_input(x_enc)
         return self._forecast_backbone(repaired, x_mark_enc, x_dec, x_mark_dec)
 
-    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None, return_radar_loss=False):
-        repaired, radar_loss = self._repair_input(x_enc, x_mark_enc, x_dec, x_mark_dec, return_radar_loss)
+    def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None):
+        repaired = self._repair_input(x_enc)
         dec_out, attns = self._forecast_backbone(repaired, x_mark_enc, x_dec, x_mark_dec)
-        if return_radar_loss:
-            # DataParallel gathers the per-replica auxiliary loss with forecasts.
-            return dec_out[:, -self.pred_len:, :], radar_loss.unsqueeze(0)
-        
+
         if self.output_attention:
             return dec_out[:, -self.pred_len:, :], attns
         else:

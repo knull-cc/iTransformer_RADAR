@@ -41,14 +41,10 @@ class Exp_Basic(object):
         pass
 
     def _forward_training(self, batch_x, batch_x_mark, dec_inp, batch_y_mark):
-        if getattr(self.args, 'use_radar', False):
-            outputs, radar_loss = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark,
-                                              return_radar_loss=True)
-            return outputs, radar_loss.mean()
         outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
         if self.args.output_attention:
             outputs = outputs[0]
-        return outputs, None
+        return outputs
 
     def vali(self):
         pass

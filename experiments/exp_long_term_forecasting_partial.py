@@ -167,42 +167,38 @@ class Exp_Long_Term_Forecast_Partial(Exp_Basic):
                 # encoder - decoder
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
-                        outputs, radar_loss = self._forward_training(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_training(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                         f_dim = -1 if self.args.features == 'MS' else 0
                         outputs = outputs[:, -self.args.pred_len:, f_dim:]
                         batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                         loss = criterion(outputs, batch_y)
-                        if radar_loss is not None:
-                            loss = loss + radar_loss
                         train_loss.append(loss.item())
                 else:
                     if self.args.output_attention:
-                        outputs, radar_loss = self._forward_training(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_training(batch_x, batch_x_mark, dec_inp, batch_y_mark)
                     elif self.args.channel_independence:
                         B, Tx, N = batch_x.shape
                         _, Ty, _ = dec_inp.shape
                         if batch_x_mark == None:
-                            outputs, radar_loss = self._forward_training(
+                            outputs = self._forward_training(
                                 batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1), batch_x_mark,
                                 dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1), batch_y_mark)
                             outputs = outputs.reshape(B, N, -1).permute(0, 2, 1)
                         else:
-                            outputs, radar_loss = self._forward_training(
+                            outputs = self._forward_training(
                                 batch_x.permute(0, 2, 1).reshape(B * N, Tx, 1),
                                 batch_x_mark.repeat_interleave(N, dim=0),
                                 dec_inp.permute(0, 2, 1).reshape(B * N, Ty, 1),
                                 batch_y_mark.repeat_interleave(N, dim=0))
                             outputs = outputs.reshape(B, N, -1).permute(0, 2, 1)
                     else:
-                        outputs, radar_loss = self._forward_training(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                        outputs = self._forward_training(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                     f_dim = -1 if self.args.features == 'MS' else 0
                     outputs = outputs[:, -self.args.pred_len:, f_dim:]
                     batch_y = batch_y[:, -self.args.pred_len:, f_dim:].to(self.device)
                     loss = criterion(outputs, batch_y)
-                    if radar_loss is not None:
-                        loss = loss + radar_loss
                     train_loss.append(loss.item())
 
                 if (i + 1) % 100 == 0:

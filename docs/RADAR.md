@@ -1,185 +1,212 @@
-# RADAR 输入修复插件
+# RADAR v2：局部风险识别与软残差抑制
 
-RADAR 在 iTransformer 的归一化与 embedding **之前**执行：历史时序分块 → 识别高依赖、低可靠块 → 在原始观测空间补全 → iTransformer。修复结果保持 `[batch, seq_len, channels]`，历史顺序、时间标记和预测输出接口保持原样。
+RADAR v2 是 iTransformer 的可选前置滤波器。它在原始观测空间执行：非等距切块 → 近期依赖先验 → 局部分布可靠性 → Top-3 风险选择 → 块内残差软抑制 → iTransformer。
 
-## 启用
+v2 已完全移除梯度显著性、Attention 依赖分数、Hard Mask、Masked MLP Imputer 和重建辅助损失。启用后每个 batch 只执行一次 forecasting backbone；RADAR 本身没有可训练参数，也不会用未来标签或 decoder 的未来占位值。
 
-推荐使用 Python 3.12；当前 `requirements.txt` 使用兼容现代 Python 的依赖范围，替代原来的 2023 年固定版本。依赖包括显式声明的 `einops` 和保留的 `reformer-pytorch==1.4.4`。使用普通 `pip install -r requirements.txt` 时，已经满足范围的包会被复用，包括 Colab 自带的 CUDA 版 PyTorch。
+## 启用与 Colab 运行
 
-在 Colab 中先把更新后的项目文件同步到 `/content/iTransformer_RADAR`，然后安装：
+推荐使用 Python 3.12。当前 `requirements.txt` 使用兼容现代 Python 的依赖范围，并显式包含 `einops` 和 `reformer-pytorch==1.4.4`。在 Colab 中先同步当前项目，再安装依赖：
 
 ```python
 %pip install -r /content/iTransformer_RADAR/requirements.txt
 ```
 
-安装成功后，可以先运行关闭 RADAR 的 iTransformer 基线：
+关闭 RADAR 的基线：
 
 ```python
 %cd /content/iTransformer_RADAR
 !bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh
 ```
 
-启用 RADAR 时只需增加开关：
+启用 RADAR v2：
 
 ```python
 %cd /content/iTransformer_RADAR
 !bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --use_radar 1
 ```
 
-该脚本默认使用 GPU 0，保留显式设置的 `CUDA_VISIBLE_DEVICES`，向全部四次运行转发附加参数，并在首次失败时停止。它会依次训练预测长度为 96、192、336 和 720 的四组实验。模型维度、学习率和训练轮数保持原配置，batch size 默认从 32 调为 128；不传附加参数时 RADAR 仍默认关闭。数据文件需要放在 `/content/iTransformer_RADAR/dataset/ETT-small/ETTh1.csv`。
-
-显存不足时可以覆盖脚本默认值；附加参数位于命令末尾，因此最后的值会生效：
+ETTh1 脚本依次运行预测长度为 96、192、336 和 720 的四组实验，默认使用 GPU 0 和 batch size 128。附加参数会转发到四组实验，并位于各命令末尾，因此可以覆盖脚本默认值：
 
 ```python
-!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --batch_size 64
-!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh --batch_size 64 --use_radar 1
+!bash ./scripts/multivariate_forecasting/ETT/iTransformer_ETTh1.sh \
+  --use_radar 1 \
+  --batch_size 64 \
+  --num_workers 2
 ```
 
-训练、验证和测试都使用 `--batch_size`。验证和测试会保留最后一个不足整批的 batch，并按样本数汇总损失；`--do_predict` 的单窗口预测仍使用 batch size 1。直接调用 `run.py` 时，全局默认值仍为 32，需要显式传入 `--batch_size 128` 才会改变。
+直接调用 `run.py` 时，全局 batch size 默认仍为 32。`--use_radar` 的默认值为 0；该开关目前只支持 `--model iTransformer`。启用后的 checkpoint 和结果目录带 `_RADAR_v2` 后缀，避免与旧版 RADAR 产物冲突。
 
-运行 iTransformer 不再强制加载 Reformer 包；只有构造 `Reformer` / `iReformer` 时才加载。如果缺少该包，错误会给出安装命令。数据加载器也使用 pandas 2.x 支持的 `drop(columns=...)` 写法。
+## 1. 非等距切块与扩张感受野
 
-在原有命令末尾添加 `--use_radar 1` 即可；也支持简写 `--use_radar`。默认 `--use_radar 0`，关闭时不创建补全器，原有 backbone 参数名称、初始化顺序和预测计算保持一致。此开关目前仅支持 `--model iTransformer`。
-
-```bash
-python -u run.py \
-  --is_training 1 \
-  --root_path ./dataset/ETT-small/ \
-  --data_path ETTh1.csv \
-  --model_id ETTh1_96_96 \
-  --model iTransformer \
-  --data ETTh1 \
-  --features M \
-  --seq_len 96 \
-  --pred_len 96 \
-  --e_layers 2 \
-  --enc_in 7 \
-  --dec_in 7 \
-  --c_out 7 \
-  --des Exp \
-  --d_model 256 \
-  --d_ff 256 \
-  --batch_size 128 \
-  --itr 1 \
-  --use_radar 1
-```
-
-训练、验证、测试和 `--do_predict` 都会自动应用输入修复。RADAR 实验的 checkpoint 和结果目录添加 `_RADAR` 后缀，避免与同配置的原始 iTransformer 实验混用。测试时使用相同开关和配置，修改 `--is_training 0`。
-
-## 1. 统一的非等距切块
-
-使用统一的、近期更细的几何切块模板。`seq_len=96` 时，**从最近往最早**的块长度为：
+`seq_len=96` 时，从最近到最早的块长度保持为：
 
 ```text
 2, 2, 4, 4, 8, 16, 28, 32
 ```
 
-按时间顺序的区间是 `[0,32), [32,60), [60,76), [76,84), [84,88), [88,92), [92,94), [94,96)`。其他历史长度按此模板同比例缩放并分配整数余数；不足 8 步时使用单点块。所有块长度为正、完整覆盖历史、无重叠，同一历史长度的所有样本和变量共享边界。
+按时间顺序排列的真实块区间为：
 
-## 2. 依赖、可靠性与风险
+```text
+[0,32), [32,60), [60,76), [76,84),
+[84,88), [88,92), [92,94), [94,96)
+```
 
-每个样本、每个变量独立评分和选择修复块；诊断分数形状为 `[B, K, C]`，块索引从最早到最近排列。
+真实块只用于 Top-K 选择和最终修复。计算局部统计量时，长度小于 8 的块使用一个以块末端为右边界、仅观察过去的 8 点感受野。对应统计区间为：
 
-**依赖 `D`。** iTransformer 的 attention 表示变量间关联，不能直接作为时间块依赖。因此对未修复输入做一次 backbone 前向，并用两次固定随机符号向量的向量–雅可比积估计输入敏感度：
+```text
+[0,32), [32,60), [60,76), [76,84),
+[80,88), [84,92), [86,94), [88,96)
+```
 
-\[
-g_t = \sqrt{\frac{1}{M}\sum_{m=1}^{M}
-\left(\frac{\partial\langle v_m, f(X)\rangle}{\partial X_t}\right)^2},
-\qquad D_i = \frac{\operatorname{Mean}_{t\in i} g_t}
-{\sum_j \operatorname{Mean}_{t\in j}g_t+\epsilon}.
-\]
+因此最近的 2 点块不会直接用两个样本估计均值和方差，也不会查看输入窗口之外或未来的数据。其他 `seq_len` 按 96 点模板同比例缩放并分配整数余数；所有真实块完整覆盖历史、互不重叠。
 
-`M=2`，`v_m` 是固定种子的 Rademacher 符号投影。该分数是输出雅可比范数的低成本估计，不是完整雅可比的精确计算。块内取均值，避免较长的历史块仅因长度更大获得更高分。`features=MS` 时只对最终目标变量的预测做投影。探测时临时关闭 dropout，随后恢复各模块原来的 train/eval 状态；只计算输入梯度，不向 backbone 的 `.grad` 累积梯度。
+## 2. 轻量级联合风险分数
 
-探测包含归一化均值随输入变化的梯度，避免直接沿用训练时 `mean.detach()` 而遗漏这部分敏感度。原来的原地归一化除法改为等价的非原地计算，使输入梯度探测和补全器训练可以反向传播；正常预测数值及 backbone 的参数训练行为保持一致。
+每个样本、每个变量独立计算 `[B,K,C]` 的分数，`K` 为块数。
 
-**可靠性 `R`。** 使用当前输入的**较早一半**作为历史 anchor，分别计算每个变量的均值和总体标准差。按一维高斯假设计算并标准化 Wasserstein 距离：
+### 2.1 近期依赖先验
 
-\[
-\widetilde W_{2,i}^{2}=\frac{(\mu_i-\mu_a)^2+(\sigma_i-\sigma_a)^2}
-{\sigma_a^2+\epsilon},\qquad R_i=\exp(-\gamma\widetilde W_{2,i}^{2}).
-\]
-
-标准化用于减轻不同变量计量单位的影响。默认 `gamma=1`，`R_i < 0.2` 视为低可靠。方差使用 `unbiased=False` 并添加数值稳定项，因此单点块和常数序列也可以计算。
-
-**重建误差 `E`。** 先屏蔽全部低可靠块，让补全器只使用高可靠历史。将该上下文补全与原观测的差异按 anchor 标准差归一化，并在块内计算均方误差：
+设真实块 `i` 的右边界为 `e_i`，历史长度为 `L`。块与预测起点之间的间隔为 `g_i=L-e_i`，依赖度定义为：
 
 \[
-E_i=\operatorname{Mean}_{t\in i}\left(\frac{X_t-\widehat X_t}{\sigma_a}\right)^2,
-\qquad \operatorname{Risk}_i=D_i E_i.
+D_i=\exp\left(-\lambda\frac{g_i}{L}\right), \qquad \lambda=3.
 \]
 
-这里遵循 `Dependency × Reconstruction Error`：Wasserstein 可靠性决定候选资格，重建误差用于联合风险排序，两者分工明确。
+最近块的 `D=1`，越早的块依赖度按指数衰减。该分数只由固定块位置决定，与模型架构、预测输出和输入数值无关，因此不再执行额外 backbone 前向、反向传播或 Attention 提取。
 
-**选择。** 候选块同时满足低可靠 `R_i < 0.2`、依赖不低于块平均水平 `D_i >= 1/K`、风险大于零，然后按风险选取**至多 3 块**。候选不足 3 块时不凑数，没有候选时保留原输入。如果某变量的全部块都低可靠，缺少可信补全上下文，则保留该变量输入。
+### 2.2 局部平滑 Anchor 与趋势感知可靠性
 
-## 3. Data-space 补全与训练
-
-补全器是所有变量共享的两层线性映射 MLP，中间使用 GELU，隐藏维度 64。输入包含屏蔽后的标准化历史值和独立的可见性标记；使用可见历史计算均值和标准差，隐藏值不会通过归一化泄漏。
-
-输出是“上下文插值 + 学习残差”，随后恢复到输入的观测尺度。残差输出层初始化为零，未训练时已有确定的插值基础：内部缺口使用两侧历史插值，窗口末尾缺口延用最近可信历史值。仅选中的风险块被替换，其他有限观测逐值保留。`seq_len=96` 时补全器增加 **18,592 个参数**，不随变量数量增加。
-
-训练时，额外随机屏蔽 1–3 个高可靠历史块，至少保留一个高可靠块作为上下文。以被屏蔽的历史观测作为自监督目标，按块平均计算标准化重建 MSE：
+设块的统计感受野从 `a_i` 开始。Anchor 使用其前面紧邻的最多 32 个历史点：
 
 \[
-\mathcal L=\mathcal L_{forecast}+0.1\mathcal L_{masked\ reconstruction}.
+A_i=[\max(0,a_i-32),a_i).
 \]
 
-补全器还可通过最终预测损失学习。低可靠原观测不作为重建标签。风险排序和硬掩码不反向传播；补全与最终预测可反向传播。验证和测试只计算预测指标，没有未来标签参与风险评分。
+Anchor 均值就是该局部历史窗口的移动平均，不再使用全局历史均值。32 点窗口比末端短块的 8 点统计感受野更长，可降低平滑周期曲率随相位变化造成的误判。最早的块没有更早上下文时，可靠性直接设为 1，不据此修复。
 
-常规训练与 `partial_train` 两条训练路径均添加重建损失，包含原有的 attention 输出、混合精度和分变量训练分支。额外损失随前向返回并在训练端汇总，避免依赖 DataParallel 副本的临时属性。内部依赖探测可以在外层 `torch.no_grad()` / `torch.inference_mode()` 中运行。
+局部窗口和 Anchor 都计算原始均值与标准差。为了重点识别突发高频噪声，同时避免把线性物理趋势误判为异常，两个窗口各自用最小二乘直线去除局部趋势，得到残差标准差 `v_i` 和 `v_i^A`。Anchor 直线还会从 Anchor 中心 `c_i^A` 外推到局部感受野中心 `c_i`：
 
-## 默认设置和诊断
+\[
+\widehat\mu_i^A=\mu_i^A+b_i^A(c_i-c_i^A),
+\]
 
-只新增启用开关；原有参数及其默认值保持不变。方法内部默认值在 `layers/RADAR.py` 的 `RADAR.__init__` 中：
+其中 `b_i^A` 是 Anchor 的局部斜率。这样，任意幅度和斜率的线性趋势都有 `\mu_i=\widehat\mu_i^A`，不会因块位置不同而被误判。原始的一维 Gaussian 2-Wasserstein 距离作为诊断量保留：
+
+\[
+W_{2,i}^2=(\mu_i-\widehat\mu_i^A)^2+(v_i-v_i^A)^2.
+\]
+
+可靠性打分进一步做无量纲化，并只把残差方差的**上升**视为高频噪声爆发。设 `q_i` 为局部窗口与 Anchor 的平均原始方差：
+
+\[
+q_i=\tfrac12(s_i^2+(s_i^A)^2),
+\]
+
+\[
+d_{\mu,i}=\frac{(\mu_i-\widehat\mu_i^A)^2}
+{(\mu_i-\widehat\mu_i^A)^2+q_i},
+\qquad
+d_{\sigma,i}=\frac{[\max(v_i-v_i^A,0)]^2}{q_i},
+\]
+
+\[
+\widetilde W_i=0.01d_{\mu,i}+d_{\sigma,i},
+\qquad R_i=\exp(-\gamma\widetilde W_i), \qquad \gamma=1.
+\]
+
+分母为 0 时对应分量定义为 0。计算不再加入带观测单位的绝对 `epsilon`，数值清零阈值也只相对于窗口方差和浮点精度，因此平移或改变计量单位不会改变可靠性。使用单向残差尺度差可避免把一个更平稳的新窗口误判为噪声，同时显著降低对干净周期信号的平滑。
+
+联合风险为：
+
+\[
+\operatorname{Risk}_i=D_i(1-R_i).
+\]
+
+每个样本、每个变量按该分数选择至多 3 个正风险块。常数序列的风险为 0，不会为了凑满 3 个而修改数据。
+
+## 3. Soft Repair：块均值不变的残差抑制
+
+对选中的真实块 `C_i`，直接从原始块计算趋势和残差：
+
+\[
+T_i=\operatorname{Mean}(C_i), \qquad N_i=C_i-T_i.
+\]
+
+抑制系数使用平滑的二次指数映射：
+
+\[
+\alpha_i=\exp(-\beta\operatorname{Risk}_i^2), \qquad \beta=10,
+\]
+
+\[
+C_i^{\mathrm{repaired}}=T_i+\alpha_iN_i.
+\]
+
+低风险时 `alpha` 接近 1，高风险时接近 0。未选中块的 `alpha` 强制为 1，逐值保持原输入。由于块内残差的均值为 0，修复前后的块均值严格相同：
+
+\[
+\operatorname{Mean}(C_i^{\mathrm{repaired}})=T_i.
+\]
+
+该过程没有置零、缺失 token、插值、外部模板或学习式填补；每个修复点都是原值与该块自身均值之间的软收缩。序列长度、时间顺序和数据类型保持不变，块内不会产生缺口。这里的连续性指时间轴和物理量级不断裂；给定的均值收缩公式本身不强制相邻块端点数值相等。
+
+## 默认内部设置
+
+命令行仍然只新增 `--use_radar` 一个开关。v2 的内部默认值位于 `layers/RADAR.py`：
 
 | 设置 | 默认值 |
-| --- | --- |
-| 每个样本、每个变量最多修复的块数 | 3 |
-| 低可靠阈值 | 0.2 |
-| Wasserstein 衰减系数 | 1.0 |
-| MLP 隐藏维度 | 64 |
-| 依赖梯度投影次数 | 2 |
-| 自监督重建损失权重 | 0.1 |
+| --- | ---: |
+| 最多修复块数 | 3 |
+| 短块统计感受野 | 8 |
+| 局部 Anchor 长度 | 32 |
+| 近期依赖衰减 `lambda` | 3.0 |
+| 可靠性温度 `gamma` | 1.0 |
+| 均值差权重 | 0.01 |
+| 残差方差差权重 | 1.0 |
+| 软抑制强度 `beta` | 10.0 |
+| 可训练参数 | 0 |
+| 额外 backbone 前向/反向 | 0 |
+
+## 诊断信息
+
+详细诊断默认关闭，避免在 Traffic 等高维数据集上保留大量 GPU 张量。需要分析单个 batch 时先显式启用：
 
 ```python
+model.radar.set_diagnostics(True)
 prediction = model(x, x_mark, dec_inp, y_mark)
 diagnostics = model.radar.last_diagnostics
-dependency = diagnostics['dependency']
-reliability = diagnostics['reliability']
-reconstruction_error = diagnostics['reconstruction_error']
-risk = diagnostics['risk']
-selected_blocks = diagnostics['selected_blocks']  # [B, K, C], bool
-repair_mask = diagnostics['repair_mask']          # [B, L, C], bool
+
+dependency = diagnostics['dependency']                 # [B, K, C]
+reliability = diagnostics['reliability']               # [B, K, C]
+risk = diagnostics['risk']                             # [B, K, C]
+alpha = diagnostics['alpha']                           # [B, K, C]
+selected_blocks = diagnostics['selected_blocks']       # [B, K, C], bool
+repair_mask = diagnostics['repair_mask']               # [B, L, C], bool
+local_mean = diagnostics['local_mean']                 # 感受野统计
+local_std = diagnostics['local_std']
+local_residual_std = diagnostics['local_residual_std']
+anchor_mean = diagnostics['anchor_mean']
+anchor_projected_mean = diagnostics['anchor_projected_mean']
+anchor_std = diagnostics['anchor_std']
+anchor_residual_std = diagnostics['anchor_residual_std']
+risk_distance = diagnostics['risk_distance']
+wasserstein_squared = diagnostics['wasserstein_squared']
+
+model.radar.set_diagnostics(False)  # 同时释放 last_diagnostics 引用
 ```
 
-这些诊断均已脱离计算图。DataParallel 时可通过 `model.module.radar` 访问基础模块，但副本诊断不会自动聚合到基础模块；需要聚合诊断时应单设备运行或自行收集。
+诊断张量均已脱离计算图，但仍位于模型设备。DataParallel 的副本诊断不会自动汇总到主模块；需要逐样本分析时建议使用单设备或在调用处显式收集。
 
-如果使用自己的训练循环，可用 `prediction, radar_loss = model(..., return_radar_loss=True)` 取得已经乘以 `0.1` 的重建损失，再加入预测损失。普通 `forward` 的返回值保持原样，包括 `output_attention=True` 时的 `(prediction, attentions)`。
+## 训练、checkpoint 与边界
 
-## 已有 backbone 权重
+RADAR v2 是确定性的无参数滤波器。训练损失恢复为原始 forecasting loss，不再包含 RADAR 重建损失。启用与关闭 RADAR 的 backbone 参数名称相同，原始 iTransformer checkpoint 可以严格加载到 v2 模型。
 
-插件没有改动原始 backbone 的参数名称和结构。可以向启用 RADAR 的模型加载原始 iTransformer 权重，允许缺少新补全器的 `radar.*` 参数；这些参数仍需训练。默认实验流程联合训练 backbone 与补全器。如果希望保留预训练 backbone 的权重，可以在自己的训练入口冻结它们：
+旧 RADAR v1 checkpoint 如果包含 `radar.imputer.*`，这些键在 v2 中已不存在。v2 使用新的 `_RADAR_v2` 实验目录，不会覆盖旧版结果。手动迁移 v1 checkpoint 时应丢弃这些旧键并重新评估/训练 backbone；v1 的 Imputer 权重没有对应的 v2 组件。
 
-```python
-missing, unexpected = model.load_state_dict(backbone_state_dict, strict=False)
-assert all(name.startswith('radar.') for name in missing)
-assert not unexpected
-for name, parameter in model.named_parameters():
-    parameter.requires_grad_(name.startswith('radar.'))
-```
+输入必须是有限浮点观测；RADAR 在检测到 NaN/Inf 时会直接报错，避免一个无效值污染整个块。缺失值应在数据预处理阶段按数据集定义编码。分布变化不必然代表错误观测；新的真实高频状态也可能被平滑。`lambda`、Anchor 长度、均值权重和抑制强度仍需要在目标数据的干净场景与受扰动场景上做消融实验。
 
-冻结参数后，输入梯度依赖探测仍然可用。
-
-## 边界与参考
-
-当前输入要求为有限浮点观测；NaN/Inf 需要在进入插件前编码。Wasserstein 偏移与错误观测并不等价，真实的新状态也可能触发修复；较早历史本身被污染时 anchor 也可能不可靠。近期短块的均值、方差估计存在采样误差。阈值、anchor 与修复收益需要在目标数据的干净及近期扰动场景中评估。
-
-梯度依赖检测增加一次 backbone 前向和两次输入梯度探测，推理时也有额外成本。现有实现未执行真实数据集上的完整性能对比，不应据此声称预测精度、鲁棒性或论文原创性已被验证。
-
-参考思路来自用户提供的 TameR（最近数据偏置与梯度重要性分析）和 SEER（低质量块识别与替换）。RADAR 按当前方案修复观测数据；SEER 的参考替换机制作用于表示空间。TameR 附录的分析梯度使用预测 MSE，本插件使用预测输出的雅可比估计，以支持不提供未来真值的部署。
-
-本地功能测试：
+本地测试：
 
 ```bash
 python -m unittest discover -s tests -v

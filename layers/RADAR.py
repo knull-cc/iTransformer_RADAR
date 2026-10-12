@@ -1,6 +1,5 @@
-"""RADAR: dependency-aware risk detection and repair in observation space."""
+"""RADAR v2: recency-aware risk scoring and soft residual suppression."""
 
-from contextlib import contextmanager
 import math
 
 import torch
@@ -9,230 +8,361 @@ from torch.nn import functional as F
 
 
 def geometric_chunk_lengths(seq_len):
-    """Return deterministic chunk lengths, ordered from newest to oldest.
-
-    Scale the common recency-refined geometric template to the lookback length.
-    Largest-remainder allocation preserves every time point, including short or
-    odd windows. No boundaries depend on the data, batch, or channel.
-    """
+    """Return deterministic chunk lengths, ordered from newest to oldest."""
     if not isinstance(seq_len, int) or seq_len < 1:
         raise ValueError("RADAR seq_len must be a positive integer")
     if seq_len < 8:
         return (1,) * seq_len
+
     template = (2, 2, 4, 4, 8, 16, 28, 32)
     lengths = [max(1, seq_len * length // 96) for length in template]
     remainder = seq_len - sum(lengths)
     if remainder > 0:
-        order = sorted(range(8), key=lambda i: (seq_len * template[i] % 96, i), reverse=True)
-        for i in order[:remainder]:
-            lengths[i] += 1
+        order = sorted(
+            range(8),
+            key=lambda index: (seq_len * template[index] % 96, index),
+            reverse=True,
+        )
+        for index in order[:remainder]:
+            lengths[index] += 1
     while sum(lengths) > seq_len:
-        i = max(range(8), key=lambda j: (lengths[j], j))
-        lengths[i] -= 1
+        index = max(range(8), key=lambda candidate: (lengths[candidate], candidate))
+        lengths[index] -= 1
     return tuple(sorted(lengths))
 
 
-@contextmanager
-def _deterministic_backbone(backbone):
-    """Temporarily disable dropout, preserving even mixed train/eval modes."""
-    modes = [(module, module.training) for module in backbone.modules()]
-    try:
-        backbone.eval()
-        yield
-    finally:
-        for module, training in modes:
-            module.training = training
-
-
-class MaskedMLPImputer(nn.Module):
-    """Channel-shared MLP predicting observations from visible history only."""
-
-    def __init__(self, seq_len, hidden_dim=64):
-        super().__init__()
-        self.residual = nn.Sequential(
-            nn.Linear(2 * seq_len, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, seq_len),
-        )
-        # An untrained plugin starts from interpolation; learning adds a residual.
-        nn.init.zeros_(self.residual[-1].weight)
-        nn.init.zeros_(self.residual[-1].bias)
-
-    @staticmethod
-    def _interpolate(values, visible):
-        # [B, C, L]; endpoint gaps extend the closest visible historical value.
-        length = values.size(-1)
-        positions = torch.arange(length, device=values.device).view(1, 1, length)
-        left = torch.where(visible, positions, -1).cummax(dim=-1).values
-        right = torch.where(visible, positions, length).flip(-1).cummin(dim=-1).values.flip(-1)
-        left = torch.where(left < 0, right, left)
-        right = torch.where(right >= length, left, right)
-        left = left.clamp(0, length - 1)
-        right = right.clamp(0, length - 1)
-        left_values = values.gather(-1, left)
-        right_values = values.gather(-1, right)
-        fraction = (positions - left).to(values.dtype) / (right - left).clamp_min(1)
-        return left_values + fraction * (right_values - left_values)
-
-    def forward(self, x, masked):
-        visible = ~masked
-        count = visible.sum(dim=1, keepdim=True).clamp_min(1)
-        # Mask before computing statistics: hidden targets cannot leak via normalization.
-        observed = torch.where(visible, x, torch.zeros_like(x))
-        mean = observed.sum(dim=1, keepdim=True) / count
-        centered = torch.where(visible, x - mean, torch.zeros_like(x))
-        scale = torch.sqrt(centered.square().sum(dim=1, keepdim=True) / count + 1e-5)
-        normalized = centered / scale
-        values = normalized.transpose(1, 2)
-        observed_mask = visible.transpose(1, 2)
-        features = torch.cat((values, observed_mask.to(values.dtype)), dim=-1)
-        residual = self.residual(features)
-        normalized_repair = self._interpolate(values, observed_mask) + residual
-        return normalized_repair.transpose(1, 2) * scale + mean
-
-
 class RADAR(nn.Module):
-    """Repair at most three high-dependency, low-reliability blocks per channel.
+    """Filter at most top_k risky chunks before the forecasting backbone.
 
-    ``predictor`` must return forecasts from the *unmodified* backbone, without
-    recursively invoking RADAR. Detection is detached; gradients flow through
-    the imputer and the final forecasting pass. No future labels are used here.
+    Risk combines a fixed recency prior with a local, trend-aware Gaussian
+    distribution comparison. Selected chunks keep their own mean and only have
+    their residual amplitude reduced. The module has no trainable parameters,
+    masks, or imputer.
     """
 
-    def __init__(self, seq_len, top_k=3, reliability_threshold=0.2,
-                 gamma=1.0, hidden_dim=64, saliency_probes=2,
-                 reconstruction_weight=0.1):
+    def __init__(self, seq_len, top_k=3, receptive_field=8, anchor_window=32,
+                 dependency_decay=3.0, gamma=1.0, mean_weight=0.01,
+                 variance_weight=1.0, repair_strength=10.0,
+                 store_diagnostics=False):
         super().__init__()
-        if top_k < 1 or saliency_probes < 1:
-            raise ValueError("RADAR top_k and saliency_probes must be positive")
-        if not 0 < reliability_threshold < 1 or gamma <= 0:
-            raise ValueError("RADAR requires 0 < reliability_threshold < 1 and gamma > 0")
+        if not isinstance(top_k, int) or top_k < 1:
+            raise ValueError("RADAR top_k must be a positive integer")
+        if not isinstance(receptive_field, int) or receptive_field < 1:
+            raise ValueError("RADAR receptive_field must be a positive integer")
+        if not isinstance(anchor_window, int) or anchor_window < 1:
+            raise ValueError("RADAR anchor_window must be a positive integer")
+        scalar_settings = {
+            "dependency_decay": dependency_decay,
+            "gamma": gamma,
+            "mean_weight": mean_weight,
+            "variance_weight": variance_weight,
+            "repair_strength": repair_strength,
+        }
+        try:
+            settings_are_finite = all(
+                math.isfinite(float(value)) for value in scalar_settings.values())
+        except (TypeError, ValueError, OverflowError):
+            settings_are_finite = False
+        if not settings_are_finite:
+            raise ValueError("RADAR scalar settings must be finite real numbers")
+        if dependency_decay <= 0 or gamma <= 0 or repair_strength <= 0:
+            raise ValueError("RADAR decay, gamma, and repair strength must be positive")
+        if mean_weight < 0 or variance_weight <= 0:
+            raise ValueError("RADAR statistical weights are invalid")
+
         self.seq_len = seq_len
         self.chunk_lengths = geometric_chunk_lengths(seq_len)
         self.num_chunks = len(self.chunk_lengths)
         self.top_k = min(top_k, self.num_chunks)
-        self.reliability_threshold = reliability_threshold
-        self.gamma = gamma
-        self.saliency_probes = saliency_probes
-        self.reconstruction_weight = reconstruction_weight
-        self.imputer = MaskedMLPImputer(seq_len, hidden_dim)
+        self.receptive_field = receptive_field
+        self.anchor_window = anchor_window
+        self.dependency_decay = float(dependency_decay)
+        self.gamma = float(gamma)
+        self.mean_weight = float(mean_weight)
+        self.variance_weight = float(variance_weight)
+        self.repair_strength = float(repair_strength)
+        self.store_diagnostics = bool(store_diagnostics)
 
-        bounds, block_ids, start = [], [], 0
-        for i, length in enumerate(reversed(self.chunk_lengths)):
-            bounds.append((start, start + length))
-            block_ids.extend([i] * length)
+        chunk_bounds = []
+        start = 0
+        for length in reversed(self.chunk_lengths):
+            chunk_bounds.append((start, start + length))
             start += length
-        self.chunk_bounds = tuple(bounds)  # chronological order, [start, end)
-        block_ids = torch.tensor(block_ids, dtype=torch.long)
+        self.chunk_bounds = tuple(chunk_bounds)
+
+        statistic_bounds = []
+        for start, end in self.chunk_bounds:
+            if end - start < self.receptive_field:
+                statistic_bounds.append((max(0, end - self.receptive_field), end))
+            else:
+                statistic_bounds.append((start, end))
+        self.statistic_bounds = tuple(statistic_bounds)
+        self.anchor_bounds = tuple(
+            (max(0, start - self.anchor_window), start)
+            for start, _ in self.statistic_bounds
+        )
+
+        self._detrend_buffer_names = {}
+        self._detrend_scales = {}
+        window_lengths = {
+            end - start for start, end in self.statistic_bounds + self.anchor_bounds
+            if end - start > 1
+        }
+        for length in sorted(window_lengths):
+            positions = torch.arange(length, dtype=torch.float32)
+            positions = positions - positions.mean()
+            name = f"_detrend_positions_{length}"
+            self.register_buffer(name, positions, persistent=False)
+            self._detrend_buffer_names[length] = name
+            self._detrend_scales[length] = 1.0 / positions.square().sum().item()
+
+        block_ids = torch.empty(seq_len, dtype=torch.long)
+        for index, (start, end) in enumerate(self.chunk_bounds):
+            block_ids[start:end] = index
         membership = F.one_hot(block_ids, self.num_chunks).float()
+
+        gaps = torch.tensor(
+            [seq_len - end for _, end in self.chunk_bounds], dtype=torch.float32)
+        dependency = torch.exp(-self.dependency_decay * gaps / float(seq_len))
+        anchor_valid = torch.tensor(
+            [end > start for start, end in self.anchor_bounds], dtype=torch.bool)
+        local_centers = torch.tensor(
+            [(start + end - 1) / 2 for start, end in self.statistic_bounds],
+            dtype=torch.float32,
+        )
+        anchor_centers = torch.tensor(
+            [((start + end - 1) / 2 if end > start else local_centers[index].item())
+             for index, (start, end) in enumerate(self.anchor_bounds)],
+            dtype=torch.float32,
+        )
+
         self.register_buffer("block_ids", block_ids, persistent=False)
         self.register_buffer("membership", membership, persistent=False)
         self.register_buffer("block_sizes", membership.sum(dim=0), persistent=False)
+        self.register_buffer("dependency_prior", dependency, persistent=False)
+        self.register_buffer("anchor_valid_prior", anchor_valid, persistent=False)
+        self.register_buffer(
+            "anchor_projection_offsets", local_centers - anchor_centers,
+            persistent=False,
+        )
         self.last_diagnostics = None
 
+    def set_diagnostics(self, enabled=True):
+        """Enable or disable detailed per-batch diagnostics.
+
+        Diagnostics are disabled by default because retaining all per-block GPU
+        tensors can be expensive for high-dimensional datasets.
+        """
+        self.store_diagnostics = bool(enabled)
+        if not self.store_diagnostics:
+            self.last_diagnostics = None
+        return self
+
     def _block_mean(self, values):
-        totals = torch.einsum("blc,lk->bkc", values, self.membership.to(values.dtype))
+        totals = torch.einsum(
+            "blc,lk->bkc", values, self.membership.to(values.dtype))
         return totals / self.block_sizes.to(values.dtype).view(1, -1, 1)
+
+    def _window_statistics(self, values, bounds, include_slopes=False):
+        means = []
+        standard_deviations = []
+        residual_standard_deviations = []
+        slopes = []
+        roundoff_multiplier = 64 * torch.finfo(values.dtype).eps
+
+        for start, end in bounds:
+            if end <= start:
+                zeros = values.new_zeros(values.size(0), values.size(2))
+                means.append(zeros)
+                standard_deviations.append(zeros)
+                residual_standard_deviations.append(zeros)
+                if include_slopes:
+                    slopes.append(zeros)
+                continue
+
+            window = values[:, start:end, :]
+            mean = window.mean(dim=1)
+            centered = window - mean.unsqueeze(1)
+            variance = centered.square().mean(dim=1)
+            standard_deviation = torch.sqrt(variance)
+
+            if end - start > 1:
+                length = end - start
+                positions = getattr(
+                    self, self._detrend_buffer_names[length]).to(values.dtype)
+                slope = (centered * positions.view(1, -1, 1)).sum(dim=1)
+                slope = slope * self._detrend_scales[length]
+                residual = centered - slope.unsqueeze(1) * positions.view(1, -1, 1)
+                residual_variance = residual.square().mean(dim=1)
+
+                # Least-squares roundoff scales with the signal variance. A
+                # relative floor preserves the score under changes of units.
+                residual_variance = torch.where(
+                    residual_variance <= roundoff_multiplier * variance,
+                    torch.zeros_like(residual_variance),
+                    residual_variance,
+                )
+                residual_standard_deviation = torch.sqrt(residual_variance)
+            else:
+                slope = torch.zeros_like(standard_deviation)
+                residual_standard_deviation = torch.zeros_like(standard_deviation)
+
+            means.append(mean)
+            standard_deviations.append(standard_deviation)
+            residual_standard_deviations.append(residual_standard_deviation)
+            if include_slopes:
+                slopes.append(slope)
+
+        statistics = (
+            torch.stack(means, dim=1),
+            torch.stack(standard_deviations, dim=1),
+            torch.stack(residual_standard_deviations, dim=1),
+        )
+        if include_slopes:
+            return statistics + (torch.stack(slopes, dim=1),)
+        return statistics
+
+    @staticmethod
+    def _scale_free_ratio(numerator, denominator):
+        """Divide same-unit squared quantities without an absolute data floor."""
+        tiny = torch.finfo(numerator.dtype).tiny
+        ratio = numerator / denominator.clamp_min(tiny)
+        return torch.where(denominator > 0, ratio, torch.zeros_like(ratio))
 
     def _point_mask(self, blocks):
         return blocks[:, self.block_ids, :]
 
-    def _reliability(self, x):
-        # The older half avoids diluting recent corruption into its own anchor.
-        anchor = x[:, :max(1, self.seq_len // 2), :]
-        anchor_mean = anchor.mean(dim=1, keepdim=True)
-        anchor_var = anchor.var(dim=1, keepdim=True, unbiased=False)
-        anchor_std = torch.sqrt(anchor_var + 1e-5)
-        block_mean = self._block_mean(x)
-        block_var = self._block_mean((x - block_mean[:, self.block_ids, :]).square())
-        block_std = torch.sqrt(block_var + 1e-5)
-        wasserstein = (block_mean - anchor_mean).square() + (block_std - anchor_std).square()
-        # Dimensionless distance makes gamma independent of measurement units.
-        distance = wasserstein / (anchor_var + 1e-5)
-        return torch.exp(-self.gamma * distance), anchor_std
+    def _score(self, values, detailed=False):
+        local_statistics = self._window_statistics(
+            values, self.statistic_bounds, include_slopes=detailed)
+        local_mean, local_std, local_residual_std = local_statistics[:3]
+        local_slope = local_statistics[3] if detailed else None
+        anchor_mean, anchor_std, anchor_residual_std, anchor_slope = \
+            self._window_statistics(values, self.anchor_bounds, include_slopes=True)
+        anchor_valid = self.anchor_valid_prior.view(1, -1, 1)
 
-    def _dependency(self, x, predictor, backbone):
-        # enable_grad is needed inside the existing no_grad validation/test loops.
-        # inference_mode(False) also supports callers using inference_mode().
-        with torch.inference_mode(False), torch.enable_grad(), \
-                torch.autocast(device_type=x.device.type, enabled=False), \
-                _deterministic_backbone(backbone):
-            probe_x = x.detach().clone().requires_grad_(True)
-            predictions = predictor(probe_x)
-            squared_gradients = torch.zeros_like(probe_x)
-            if predictions.requires_grad:
-                # Fixed Rademacher projections estimate the Jacobian norm without
-                # materializing [forecast_length, channels, lookback, channels].
-                # Using forecast.sum() alone would cancel opposite-signed outputs.
-                generator = torch.Generator(device="cpu").manual_seed(2023)
-                shape = tuple(predictions.shape[1:])
-                for i in range(self.saliency_probes):
-                    signs = torch.randint(0, 2, shape, generator=generator)
-                    signs = signs.to(device=predictions.device, dtype=predictions.dtype) * 2 - 1
-                    signs = signs.unsqueeze(0).expand_as(predictions) / math.sqrt(signs.numel())
-                    gradient = torch.autograd.grad(
-                        predictions, probe_x, grad_outputs=signs,
-                        retain_graph=i + 1 < self.saliency_probes,
-                        create_graph=False, allow_unused=True,
-                    )[0]
-                    if gradient is not None:
-                        squared_gradients += gradient.detach().square()
-            importance = torch.sqrt(squared_gradients / self.saliency_probes)
-            scores = self._block_mean(importance)
-            return (scores / scores.sum(dim=1, keepdim=True).clamp_min(1e-12)).detach()
+        # Compare the local mean with the preceding trend extrapolated to the
+        # local receptive-field center. This makes every affine trend a zero-
+        # risk reference regardless of its slope or measurement unit.
+        projection_offsets = self.anchor_projection_offsets.to(values.dtype)
+        projected_anchor_mean = (
+            anchor_mean + anchor_slope * projection_offsets.view(1, -1, 1))
 
-    def _select_blocks(self, dependency, reliability, reconstruction_error):
-        # A large deviation with negligible forecasting influence is not high risk.
-        eligible = (reliability < self.reliability_threshold) & (dependency >= 1.0 / self.num_chunks)
-        eligible &= (reliability >= self.reliability_threshold).any(dim=1, keepdim=True)
-        risk = dependency * reconstruction_error
-        ranked_risk = risk.masked_fill(~eligible, -torch.inf)
-        indices = ranked_risk.topk(self.top_k, dim=1).indices
-        selected = torch.zeros_like(eligible).scatter_(1, indices, True)
-        selected &= eligible & (risk > 0)
-        return selected, risk
+        mean_wasserstein_sq = (local_mean - projected_anchor_mean).square()
 
-    def _reconstruction_loss(self, x, unreliable, anchor_std):
-        reliable = ~unreliable
-        # Mask 1..top_k trusted blocks, leaving at least one trusted block visible.
-        number = torch.randint(1, self.top_k + 1,
-                               (x.size(0), 1, x.size(2)), device=x.device)
-        number = torch.minimum(number, (reliable.sum(dim=1, keepdim=True) - 1).clamp_min(0))
-        priority = torch.rand(reliable.shape, device=x.device).masked_fill(~reliable, torch.inf)
-        ranks = priority.argsort(dim=1).argsort(dim=1)
-        training_blocks = (ranks < number) & reliable
-        completion = self.imputer(x.detach(), self._point_mask(unreliable | training_blocks))
-        errors = self._block_mean(((completion - x.detach()) / anchor_std).square())
-        return (errors * training_blocks).sum() / training_blocks.sum().clamp_min(1)
+        # Reliability is deliberately directional in the variance component:
+        # a sudden increase in detrended residual variance is evidence of a
+        # high-frequency burst, while a quieter recent window is not.
+        pooled_raw_variance = 0.5 * (
+            local_std.square() + anchor_std.square())
+        mean_distance = self._scale_free_ratio(
+            mean_wasserstein_sq,
+            mean_wasserstein_sq + pooled_raw_variance,
+        )
+        variance_burst_sq = torch.relu(
+            local_residual_std - anchor_residual_std).square()
+        variance_distance = self._scale_free_ratio(
+            variance_burst_sq, pooled_raw_variance)
+        mean_distance = torch.where(
+            anchor_valid, mean_distance, torch.zeros_like(mean_distance))
+        variance_distance = torch.where(
+            anchor_valid, variance_distance, torch.zeros_like(variance_distance))
+        risk_distance = (
+            self.mean_weight * mean_distance
+            + self.variance_weight * variance_distance
+        )
+        reliability = torch.exp(-self.gamma * risk_distance)
+        reliability = torch.where(
+            anchor_valid, reliability, torch.ones_like(reliability))
 
-    def forward(self, x, predictor, backbone, compute_reconstruction_loss=False):
-        if x.ndim != 3 or x.size(1) != self.seq_len:
-            raise ValueError("RADAR expects input shape [batch, seq_len, channels]")
-        if not torch.isfinite(x).all():
-            raise ValueError("RADAR expects finite observations; encode missing values before forecasting")
-        original = x
-        original_dtype = x.dtype
-        # Detection and imputation statistics stay in float32 under mixed precision.
-        x = x.float()
-        with torch.no_grad():
-            reliability, anchor_std = self._reliability(x)
-            unreliable = reliability < self.reliability_threshold
-        dependency = self._dependency(x, predictor, backbone)
-        completion = self.imputer(x, self._point_mask(unreliable))
-        with torch.no_grad():
-            reconstruction_error = self._block_mean(((completion.detach() - x) / anchor_std).square())
-            selected, risk = self._select_blocks(dependency, reliability, reconstruction_error)
-            repair_mask = self._point_mask(selected)
-        repaired = torch.where(repair_mask, completion.to(original_dtype), original)
-        reconstruction_loss = x.new_zeros(())
-        if compute_reconstruction_loss and self.training and torch.is_grad_enabled():
-            reconstruction_loss = self._reconstruction_loss(x, unreliable, anchor_std)
-        self.last_diagnostics = {
+        dependency = self.dependency_prior.to(values.dtype).view(1, -1, 1)
+        risk = dependency * (1 - reliability)
+        if not detailed:
+            return risk
+
+        # Fill the undefined oldest Anchor only for readable diagnostics. Its
+        # reliability has already been forced to one above.
+        anchor_mean = torch.where(anchor_valid, anchor_mean, local_mean)
+        projected_anchor_mean = torch.where(
+            anchor_valid, projected_anchor_mean, local_mean)
+        anchor_std = torch.where(anchor_valid, anchor_std, local_std)
+        anchor_residual_std = torch.where(
+            anchor_valid, anchor_residual_std, local_residual_std)
+        anchor_slope = torch.where(anchor_valid, anchor_slope, local_slope)
+        mean_wasserstein_sq = (local_mean - projected_anchor_mean).square()
+        scale_wasserstein_sq = (local_residual_std - anchor_residual_std).square()
+        wasserstein_sq = mean_wasserstein_sq + scale_wasserstein_sq
+        dependency = dependency.expand(values.size(0), -1, values.size(2))
+        return {
             "dependency": dependency,
             "reliability": reliability,
-            "reconstruction_error": reconstruction_error,
             "risk": risk,
-            "selected_blocks": selected,
-            "repair_mask": repair_mask,
+            "risk_distance": risk_distance,
+            "wasserstein_distance": torch.sqrt(wasserstein_sq),
+            "wasserstein_squared": wasserstein_sq,
+            "mean_distance": mean_distance,
+            "variance_distance": variance_distance,
+            "local_mean": local_mean,
+            "local_std": local_std,
+            "local_residual_std": local_residual_std,
+            "local_slope": local_slope,
+            "anchor_mean": anchor_mean,
+            "anchor_projected_mean": projected_anchor_mean,
+            "anchor_std": anchor_std,
+            "anchor_residual_std": anchor_residual_std,
+            "anchor_slope": anchor_slope,
+            "anchor_valid": anchor_valid.expand_as(reliability),
         }
-        return repaired, self.reconstruction_weight * reconstruction_loss
+
+    def _select(self, risk):
+        values, indices = risk.topk(self.top_k, dim=1)
+        selected = torch.zeros_like(risk, dtype=torch.bool)
+        selected.scatter_(1, indices, values > 0)
+        return selected
+
+    @staticmethod
+    def _require_finite(x):
+        finite = torch.isfinite(x).all()
+        if x.device.type == "cuda" and hasattr(torch, "_assert_async"):
+            torch._assert_async(finite, "RADAR requires finite observations")
+        elif not finite.item():
+            raise ValueError("RADAR requires finite observations; found NaN or Inf")
+
+    def forward(self, x):
+        if x.ndim != 3 or x.size(1) != self.seq_len:
+            raise ValueError("RADAR expects input shape [batch, seq_len, channels]")
+        if not torch.is_floating_point(x):
+            raise TypeError("RADAR expects floating-point observations")
+        self._require_finite(x)
+
+        original_dtype = x.dtype
+        statistics = x if x.dtype in (torch.float32, torch.float64) else x.float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            with torch.no_grad():
+                score = self._score(statistics, detailed=self.store_diagnostics)
+                diagnostics = score if self.store_diagnostics else None
+                risk = diagnostics["risk"] if diagnostics is not None else score
+                selected = self._select(risk)
+                block_alpha = torch.exp(
+                    -self.repair_strength * risk.square())
+                block_alpha = torch.where(
+                    selected, block_alpha, torch.ones_like(block_alpha))
+                repair_mask = self._point_mask(selected)
+
+            trend = self._block_mean(statistics)
+            point_trend = trend[:, self.block_ids, :]
+            point_alpha = block_alpha[:, self.block_ids, :]
+            softened = point_trend + point_alpha * (statistics - point_trend)
+        repaired = torch.where(repair_mask, softened.to(original_dtype), x)
+
+        if self.store_diagnostics:
+            self.last_diagnostics = {
+                **{name: value.detach() for name, value in diagnostics.items()},
+                "alpha": block_alpha.detach(),
+                "trend": trend.detach(),
+                "selected_blocks": selected.detach(),
+                "repair_mask": repair_mask.detach(),
+            }
+        else:
+            self.last_diagnostics = None
+        return repaired
